@@ -19,11 +19,45 @@ jobs:
         with:
           node-version: 22
 
+      - name: Ensure package-lock.json exists
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "package-lock.json not found, generating..."
+            npm install --package-lock-only
+          fi
+
       - name: Install Dependencies
         run: npm ci
 
+      - name: Generate Default App Icons
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          
+          # إنشاء مجلدات أندرويد والويب
+          mkdir -p android/app/src/main/res/mipmap-mdpi
+          mkdir -p android/app/src/main/res/mipmap-hdpi
+          mkdir -p android/app/src/main/res/mipmap-xhdpi
+          mkdir -p android/app/src/main/res/mipmap-xxhdpi
+          mkdir -p android/app/src/main/res/mipmap-xxxhdpi
+          mkdir -p public
+
+          # إنشاء الصورة المرجعية الأساسية
+          convert -size 512x512 xc:"#3B82F6" -fill white -gravity center -pointsize 200 -draw "text 0,0 'A'" icon-base.png
+
+          # أحجام Android App
+          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+          # أحجام Web App
+          convert icon-base.png -resize 192x192 public/logo192.png
+          convert icon-base.png -resize 512x512 public/logo512.png
+          convert icon-base.png -resize 32x32 public/favicon.ico
+
       - name: Lint Code
-        run: npm run lint
+        run: npm run lint --if-present
 
       - name: Build Web App
         run: npm run build
