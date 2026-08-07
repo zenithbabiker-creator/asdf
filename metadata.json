@@ -1,0 +1,6 @@
+{
+  "name": "حاسبة تربة الحدائق بالواقع المعزز - AR Garden & Soil Calculator",
+  "description": "تطبيق قياس مساحة وتحديد حجم التربة والردم للحدائق والمسطحات الخضراء باستخدام تقنيات الواقع المعزز ARCore وHuawei AR Engine.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
