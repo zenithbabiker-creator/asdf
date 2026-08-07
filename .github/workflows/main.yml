@@ -62,6 +62,12 @@ jobs:
       - name: Build Web App
         run: npm run build
 
+      - name: Upload Web Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build-files
+          path: build/ # أو dist/ حسب إطار العمل المستخدم لديك
+
   android-build:
     name: Build Standalone Android APK
     runs-on: ubuntu-latest
@@ -81,5 +87,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      # تم إزالة الإلتفاف عن الخطأ ليعطيك خطأ حقيقي إن لم يكتمل البناء
       - name: Build Android Debug APK
-        run: ./gradlew assembleDebug || echo "Gradle wrapper ready for standalone export"
+        run: ./gradlew assembleDebug
+
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
