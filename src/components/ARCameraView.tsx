@@ -244,49 +244,61 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS'>('FREEHAND');
   const [isDragging, setIsDragging] = useState(false);
 
-  // Helper to extract canvas scaled coordinates from Touch/Mouse event
-  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+  // Ref for zero-lag touch tracking
+  const pointsRef = useRef<Point2D[]>(points);
+  useEffect(() => {
+    pointsRef.current = points;
+  }, [points]);
+
+  // Helper to extract canvas scaled coordinates from Pointer event
+  const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return null;
     const rect = canvasRef.current.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+
     const scaleX = canvasRef.current.width / rect.width;
     const scaleY = canvasRef.current.height / rect.height;
 
-    let clientX = 0;
-    let clientY = 0;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
 
-    if ('touches' in e && e.touches.length > 0) {
-      clientX = e.touches[0].clientX;
-      clientY = e.touches[0].clientY;
-    } else if ('clientX' in e) {
-      clientX = e.clientX;
-      clientY = e.clientY;
-    } else {
-      return null;
-    }
+    // Clamp coordinates within internal canvas resolution (0-720 x 0-420)
+    const clampedX = Math.max(0, Math.min(canvasRef.current.width, x));
+    const clampedY = Math.max(0, Math.min(canvasRef.current.height, y));
 
-    const x = (clientX - rect.left) * scaleX;
-    const y = (clientY - rect.top) * scaleY;
-
-    return { x, y };
+    return { x: clampedX, y: clampedY };
   };
 
-  // Start gesture drawing / touch down
-  const handlePointerDown = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+  // Start gesture drawing / touch down (PointerEvents API eliminates duplicate touchstart+mousedown triggers)
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (mode !== 'SURFACE') return;
+    if (e.cancelable) e.preventDefault();
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch (_) {}
+
     const coords = getCanvasCoords(e);
     if (!coords) return;
 
     setIsDragging(true);
 
     if (drawTool === 'FREEHAND') {
-      // In freehand mode, start or continue shape
-      const newPts = [...points, coords];
+      const newPts = [...pointsRef.current, coords];
+      pointsRef.current = newPts;
       setPoints(newPts);
       const calculatedArea = calculateAreaInM2(newPts);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
     } else {
-      // Tap points mode
-      const newPts = [...points, coords];
+      // TAP_POINTS mode with duplicate point protection
+      const currentPts = pointsRef.current;
+      if (currentPts.length > 0) {
+        const lastPt = currentPts[currentPts.length - 1];
+        const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
+        if (dist < 12) return; // Prevent duplicate nearby point triggers
+      }
+      const newPts = [...currentPts, coords];
+      pointsRef.current = newPts;
       setPoints(newPts);
       const calculatedArea = calculateAreaInM2(newPts);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
@@ -294,27 +306,39 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   };
 
   // Continuous touch move / drag gesture drawing
-  const handlePointerMove = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (mode !== 'SURFACE' || !isDragging || drawTool !== 'FREEHAND') return;
+    if (e.cancelable) e.preventDefault();
+
     const coords = getCanvasCoords(e);
     if (!coords) return;
 
-    // Check distance from last added point to prevent redundant dense points
-    if (points.length > 0) {
-      const lastPt = points[points.length - 1];
+    const currentPts = pointsRef.current;
+    if (currentPts.length > 0) {
+      const lastPt = currentPts[currentPts.length - 1];
       const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
-      if (dist < 10) return; // Minimum 10px spacing
+      if (dist < 8) return; // Smooth spacing
     }
 
-    const newPts = [...points, coords];
-    setPoints(newPts);
+    const newPts = [...currentPts, coords];
+    pointsRef.current = newPts;
+
     const calculatedArea = calculateAreaInM2(newPts);
     if (onAreaCalculated) onAreaCalculated(calculatedArea);
   };
 
   // Touch up / End gesture
-  const handlePointerUp = () => {
-    setIsDragging(false);
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch (_) {}
+
+    if (isDragging) {
+      setIsDragging(false);
+      setPoints([...pointsRef.current]);
+    }
   };
 
   // Auto preset sample garden polygon over snapshot
@@ -414,13 +438,14 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       // Mode Overlays
       if (mode === 'SURFACE') {
-        if (points.length > 0) {
+        const pts = pointsRef.current;
+        if (pts.length > 0) {
           // Fill polygon
-          if (points.length >= 3) {
+          if (pts.length >= 3) {
             ctx.beginPath();
-            ctx.moveTo(points[0].x, points[0].y);
-            for (let i = 1; i < points.length; i++) {
-              ctx.lineTo(points[i].x, points[i].y);
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) {
+              ctx.lineTo(pts[i].x, pts[i].y);
             }
             ctx.closePath();
             ctx.fillStyle = 'rgba(16, 185, 129, 0.35)';
@@ -434,11 +459,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
           // Draw Edges & Distance Labels
           ctx.font = 'bold 11px sans-serif';
-          for (let i = 0; i < points.length; i++) {
-            const nextIdx = (i + 1) % points.length;
-            if (points.length >= 2) {
-              const p1 = points[i];
-              const p2 = points[nextIdx];
+          for (let i = 0; i < pts.length; i++) {
+            const nextIdx = (i + 1) % pts.length;
+            if (pts.length >= 2) {
+              const p1 = pts[i];
+              const p2 = pts[nextIdx];
               ctx.beginPath();
               ctx.moveTo(p1.x, p1.y);
               ctx.lineTo(p2.x, p2.y);
@@ -460,7 +485,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           }
 
           // Draw Points / Vertices
-          points.forEach((pt, index) => {
+          pts.forEach((pt, index) => {
             ctx.beginPath();
             ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
             ctx.fillStyle = '#10b981';
@@ -552,14 +577,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         ref={canvasRef}
         width={720}
         height={420}
-        onMouseDown={handlePointerDown}
-        onMouseMove={handlePointerMove}
-        onMouseUp={handlePointerUp}
-        onMouseLeave={handlePointerUp}
-        onTouchStart={handlePointerDown}
-        onTouchMove={handlePointerMove}
-        onTouchEnd={handlePointerUp}
-        className="relative z-10 w-full h-[320px] sm:h-[400px] object-cover cursor-crosshair touch-none bg-transparent"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        className="relative z-10 w-full aspect-[720/420] object-fill cursor-crosshair touch-none select-none bg-transparent"
       />
 
       {/* Touch Drawing Instruction Banner */}
@@ -605,31 +627,31 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       )}
 
       {/* Main Action Bar for Snapshot Capture System */}
-      <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/85 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl">
+      <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl">
         
         {/* Primary Controls */}
         <div className="flex items-center gap-2 flex-wrap">
-          {/* If Live Camera is active, show Freeze Frame Snapshot Button */}
+          {/* Main Camera Snapshot Button (Freeze Frame) */}
           {isCameraActive && !capturedSnapshot && (
             <button
               id="take-snapshot-btn"
               onClick={handleTakeSnapshot}
-              className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95"
+              className="px-4 py-2 bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95 text-xs sm:text-sm border border-emerald-400/30"
             >
-              <Aperture className="w-4 h-4 animate-spin-slow" />
-              التقاط اللقطة الحالية (Freeze Frame)
+              <Aperture className="w-4 h-4 text-white animate-spin-slow" />
+              <span>التقاط اللقطة وتجميد الصورة 📸</span>
             </button>
           )}
 
-          {/* If Snapshot is already captured, show Retake Button */}
+          {/* Retake Snapshot Button */}
           {capturedSnapshot && (
             <button
               id="retake-snapshot-btn"
               onClick={handleRetakeSnapshot}
-              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 rounded-xl font-semibold flex items-center gap-1.5 transition-all"
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/40 rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              إعادة التقاط صورة جديدة
+              <span>إعادة التقاط صورة جديدة 🔄</span>
             </button>
           )}
 

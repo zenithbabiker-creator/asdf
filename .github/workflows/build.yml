@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Web and Android APK
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build-android:
-    name: Build Android App (APK)
+  build-all:
+    name: Build Web App & Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -26,21 +26,41 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Install Project Dependencies
-        run: npm install
+      - name: Install Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      - name: Install Capacitor Core & Android Packages
-        run: npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli --save
-
-      - name: Build Web App
+      - name: Build Vite Web App
         run: npm run build
 
-      # إزالة المجلد المكسور وإنشاء مشروع أندرويد متكامل ونظيف
-      - name: Re-generate Clean Android Project
+      - name: Convert Web App to Android (Capacitor)
         run: |
-          rm -rf android
-          npx cap add android
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
+            npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
+          fi
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
           npx cap sync android
+
+      - name: Generate Default Icon for Android
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          
+          convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
+
+          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
+
+          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
@@ -50,13 +70,13 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug
 
-      - name: Upload Android APK Artifact
+      - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Upload Web Dist Artifact
+      - name: Upload Web Dist
         uses: actions/upload-artifact@v4
         with:
           name: web-dist-files
