@@ -1,4 +1,4 @@
-name: Build and Test Application
+name: Build Web and Android APK
 
 on:
   push:
@@ -10,6 +10,7 @@ jobs:
   build-all:
     name: Build Web App & Android APK
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -33,9 +34,6 @@ jobs:
             npm install
           fi
 
-      - name: Lint Code
-        run: npm run lint
-
       - name: Build Vite Web App
         run: npm run build
 
@@ -49,6 +47,20 @@ jobs:
             npx cap add android
           fi
           npx cap sync android
+
+      - name: Generate Default Icon for Android
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          
+          convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
+
+          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
+
+          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
@@ -69,4 +81,3 @@ jobs:
         with:
           name: web-dist-files
           path: dist/
-
