@@ -1,4 +1,4 @@
-name: Build and Test Application
+name: Build Android APK
 
 on:
   push:
@@ -7,9 +7,10 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build-all:
-    name: Build Web App & Android APK
+  build-android:
+    name: Build Android App (APK)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -26,56 +27,29 @@ jobs:
           distribution: 'temurin'
 
       - name: Install Dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm install
 
-      - name: Install Capacitor Core & Android CLI
-        run: |
-          npm install @capacitor/core @capacitor/android
-          npm install -D @capacitor/cli
-
-      - name: Build Vite Web App
+      - name: Build Web App
         run: npm run build
 
-      - name: Initialize & Add Android Platform
-        run: |
-          # 1. إنشاء ملف الإعدادات في حال عدم وجوده
-          if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
-            npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
-          fi
+      - name: Sync Capacitor with Android
+        run: npx cap sync android
 
-          # 2. إضافة منصة الأندرويد مع إظهار تفاصيل الخطأ إن وجد
-          if [ ! -d "android" ]; then
-            npx cap add android
-          fi
-
-          # 3. مزامنة الملفات المجمعة
-          npx cap sync android
-
-      - name: Verify Android Directory & Make Gradle Executable
-        run: |
-          if [ ! -d "android" ]; then
-            echo "::error::فشل إنشاء مجلد android بواسطة Capacitor!"
-            exit 1
-          fi
-          cd android
-          chmod +x gradlew
+      - name: Grant Execute Permission for Gradle
+        working-directory: android
+        run: chmod +x gradlew
 
       - name: Build Android Debug APK
         working-directory: android
         run: ./gradlew assembleDebug
 
-      - name: Upload Android APK
+      - name: Upload Android APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Upload Web Dist
+      - name: Upload Web Dist Artifact
         uses: actions/upload-artifact@v4
         with:
           name: web-dist-files
