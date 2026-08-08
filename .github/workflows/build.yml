@@ -1,4 +1,4 @@
-name: Build Web and Android APK
+name: Build Android APK
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  build-all:
-    name: Build Web App & Android APK
+  build-android:
+    name: Build Android App (APK)
     runs-on: ubuntu-latest
 
     steps:
@@ -27,40 +27,16 @@ jobs:
           distribution: 'temurin'
 
       - name: Install Dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm install
 
-      - name: Build Vite Web App
+      - name: Install Capacitor CLI Globally & Locally
+        run: npm install -g @capacitor/cli @capacitor/core
+
+      - name: Build Web App
         run: npm run build
 
-      - name: Convert Web App to Android (Capacitor)
-        run: |
-          npm install @capacitor/core @capacitor/cli @capacitor/android
-          if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
-            npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
-          fi
-          if [ ! -d android ]; then
-            npx cap add android
-          fi
-          npx cap sync android
-
-      - name: Generate Default Icon for Android
-        run: |
-          sudo apt-get update && sudo apt-get install -y imagemagick
-          
-          convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
-
-          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
-
-          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
-          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+      - name: Sync Capacitor with Android
+        run: cap sync android || npx --yes @capacitor/cli sync android
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
@@ -70,13 +46,13 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug
 
-      - name: Upload Android APK
+      - name: Upload Android APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Upload Web Dist
+      - name: Upload Web Dist Artifact
         uses: actions/upload-artifact@v4
         with:
           name: web-dist-files
