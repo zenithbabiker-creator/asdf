@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { Point2D, AREngineType } from '../types';
-import { Camera as CapCamera, CameraResultType, CameraSource } from '@capacitor/camera';
+import { Camera as CapCamera, CameraResultType, CameraSource, CameraDirection } from '@capacitor/camera';
 import { 
   Camera, 
   Aperture, 
@@ -71,13 +71,44 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       }
 
       let stream: MediaStream | null = null;
+
+      // 1. Try finding specific back/rear video device
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false,
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+        const backCamera = videoDevices.find((d) => {
+          const label = (d.label || '').toLowerCase();
+          return label.includes('back') || label.includes('rear') || label.includes('environment') || label.includes('خلفية');
         });
-      } catch (err) {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+
+        if (backCamera && backCamera.deviceId) {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: backCamera.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+        }
+      } catch (enumErr) {
+        console.log('Enumeration fallback:', enumErr);
+      }
+
+      // 2. Force exact rear environment facing mode
+      if (!stream) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { exact: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+        } catch (exactErr) {
+          // 3. Fallback to ideal environment camera
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+              audio: false,
+            });
+          } catch (idealErr) {
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          }
+        }
       }
 
       if (videoRef.current && stream) {
@@ -138,6 +169,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         allowEditing: false,
         resultType: CameraResultType.DataUrl,
         source: CameraSource.Camera,
+        direction: CameraDirection.Rear,
       });
 
       if (image.dataUrl) {
