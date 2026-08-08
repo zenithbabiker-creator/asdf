@@ -26,17 +26,18 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Install Dependencies
+      - name: Install Project Dependencies
         run: npm install
 
-      - name: Install Capacitor CLI Globally & Locally
-        run: npm install -g @capacitor/cli @capacitor/core
+      # تثبيت حزم Capacitor المفقودة بشكل صريح
+      - name: Install Capacitor Core Android Packages
+        run: npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli
 
       - name: Build Web App
         run: npm run build
 
       - name: Sync Capacitor with Android
-        run: cap sync android || npx --yes @capacitor/cli sync android
+        run: npx cap sync android
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
