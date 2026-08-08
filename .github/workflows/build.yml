@@ -29,8 +29,7 @@ jobs:
       - name: Install Project Dependencies
         run: npm install
 
-      # تثبيت حزم Capacitor المفقودة بشكل صريح
-      - name: Install Capacitor Core Android Packages
+      - name: Install Capacitor Core & Android Packages
         run: npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli
 
       - name: Build Web App
