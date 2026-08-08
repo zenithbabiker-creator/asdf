@@ -35,17 +35,12 @@ jobs:
       - name: Build Web App
         run: npm run build
 
-      - name: Sync Capacitor with Android
-        run: npx cap sync android
-
-      # خطوة حاسمة: التأكد من وجود ملف gradlew وإنشاؤه إن كان مفقوداً
-      - name: Ensure Gradle Wrapper Exists
-        working-directory: android
+      # إزالة المجلد المكسور وإنشاء مشروع أندرويد متكامل ونظيف
+      - name: Re-generate Clean Android Project
         run: |
-          if [ ! -f "gradlew" ]; then
-            echo "gradlew not found, generating Gradle Wrapper..."
-            gradle wrapper
-          fi
+          rm -rf android
+          npx cap add android
+          npx cap sync android
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
