@@ -29,36 +29,38 @@ jobs:
       - name: Install Project Dependencies
         run: npm install
 
-      # 1. تثبيت حزم Capacitor المفتقدة بنفس الإصدارات المتوافقة
-      - name: Ensure Capacitor Dependencies Installed
-        run: |
-          npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli --save
+      - name: Install Capacitor Core & Android Packages
+        run: npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli --save
 
       - name: Build Web App
         run: npm run build
 
-      # 2. إجراء المزامنة باستخدام npx لضمان استخدام النسخة المحلية المثبتة في node_modules
       - name: Sync Capacitor with Android
         run: npx cap sync android
 
-      # 3. منح صلاحيات التشغيل لملف gradlew داخل مجلد android
+      # خطوة حاسمة: التأكد من وجود ملف gradlew وإنشاؤه إن كان مفقوداً
+      - name: Ensure Gradle Wrapper Exists
+        working-directory: android
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "gradlew not found, generating Gradle Wrapper..."
+            gradle wrapper
+          fi
+
       - name: Grant Execute Permission for Gradle
         working-directory: android
         run: chmod +x gradlew
 
-      # 4. بناء الـ APK
       - name: Build Android Debug APK
         working-directory: android
         run: ./gradlew assembleDebug
 
-      # 5. رفع الـ APK الناتج كملف جاهز للتنزيل
       - name: Upload Android APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
-      # 6. رفع ملفات الويب المجمعة
       - name: Upload Web Dist Artifact
         uses: actions/upload-artifact@v4
         with:
