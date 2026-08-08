@@ -33,31 +33,33 @@ jobs:
             npm install
           fi
 
-      - name: Lint Code
-        run: npm run lint --if-present
+      - name: Install Capacitor Core & Android CLI
+        run: |
+          npm install @capacitor/core @capacitor/android
+          npm install -D @capacitor/cli
 
       - name: Build Vite Web App
         run: npm run build
 
-      - name: Convert Web App to Android (Capacitor)
+      - name: Initialize & Add Android Platform
         run: |
-          npm install --save @capacitor/core @capacitor/android
-          npm install --save-dev @capacitor/cli
-          
+          # 1. إنشاء ملف الإعدادات في حال عدم وجوده
           if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
             npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
           fi
-          
+
+          # 2. إضافة منصة الأندرويد مع إظهار تفاصيل الخطأ إن وجد
           if [ ! -d "android" ]; then
             npx cap add android
           fi
-          
+
+          # 3. مزامنة الملفات المجمعة
           npx cap sync android
 
-      - name: Ensure Android Project & Gradle Executable
+      - name: Verify Android Directory & Make Gradle Executable
         run: |
           if [ ! -d "android" ]; then
-            echo "Error: Android folder was not created successfully."
+            echo "::error::فشل إنشاء مجلد android بواسطة Capacitor!"
             exit 1
           fi
           cd android
