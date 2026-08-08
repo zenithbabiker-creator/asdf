@@ -19,16 +19,23 @@ interface ARDepthHoleCalculatorProps {
 
 export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ engine }) => {
   const [points, setPoints] = useState<any[]>([]);
+  const [holeWidthM, setHoleWidthM] = useState<number>(2.0);
+  const [holeLengthM, setHoleLengthM] = useState<number>(3.0);
   const [maxDepthM, setMaxDepthM] = useState<number>(0.45);
   const [avgDepthM, setAvgDepthM] = useState<number>(0.30);
-  const [surfaceAreaM2, setSurfaceAreaM2] = useState<number>(6.2);
-  const [backfillVolumeM3, setBackfillVolumeM3] = useState<number>(1.86);
+
+  // Surface Area = Width x Length
+  const calculatedAreaM2 = Math.round((holeWidthM * holeLengthM) * 100) / 100;
+
+  // Formula: Volume (m³) = Area (m²) × Average Depth (m)
+  const backfillVolumeM3 = Math.round((calculatedAreaM2 * avgDepthM) * 1000) / 1000;
 
   // Calculate soil needed for backfill
   const densityKgM3 = 1300; // Soil backfill density
   const soilWeightKg = Math.round(backfillVolumeM3 * densityKgM3);
   const soilWeightTons = (soilWeightKg / 1000).toFixed(2);
   const bagsCount50L = Math.ceil((backfillVolumeM3 * 1000) / 50);
+  const bagsCount25L = Math.ceil((backfillVolumeM3 * 1000) / 25);
 
   // Recommended extra 10% volume for compaction/settlement
   const compactedVolumeM3 = Math.round((backfillVolumeM3 * 1.10) * 1000) / 1000;
@@ -65,10 +72,9 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
             points={points}
             setPoints={setPoints}
             engine={engine}
-            onDepthCalculated={(maxD, avgD, vol) => {
+            onDepthCalculated={(maxD, avgD) => {
               setMaxDepthM(maxD);
               setAvgDepthM(avgD);
-              setBackfillVolumeM3(vol);
             }}
           />
 
@@ -107,6 +113,58 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
         {/* Right Column: Backfill Calculations (5 Cols) */}
         <div className="lg:col-span-5 space-y-5">
           
+          {/* Hole Dimensions Input & Controls Card */}
+          <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
+            <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2 border-b border-slate-100 pb-2">
+              <Layers className="w-4 h-4 text-amber-600" />
+              أبعاد وقياسات الحفرة (السطح غير المستوي):
+            </h4>
+
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">العرض (متر):</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0.1"
+                  value={holeWidthM}
+                  onChange={(e) => setHoleWidthM(Math.max(0.1, parseFloat(e.target.value) || 0.1))}
+                  className="w-full bg-slate-50 border border-slate-200 text-slate-900 font-bold p-2 rounded-xl text-center focus:ring-2 focus:ring-amber-500 outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">الطول (متر):</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0.1"
+                  value={holeLengthM}
+                  onChange={(e) => setHoleLengthM(Math.max(0.1, parseFloat(e.target.value) || 0.1))}
+                  className="w-full bg-slate-50 border border-slate-200 text-slate-900 font-bold p-2 rounded-xl text-center focus:ring-2 focus:ring-amber-500 outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">العمق المتوسط (متر):</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.05"
+                  max="5.0"
+                  value={avgDepthM}
+                  onChange={(e) => setAvgDepthM(Math.max(0.05, parseFloat(e.target.value) || 0.05))}
+                  className="w-full bg-slate-50 border border-slate-200 text-slate-900 font-bold p-2 rounded-xl text-center focus:ring-2 focus:ring-amber-500 outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="text-xs bg-amber-50/80 border border-amber-200 p-2.5 rounded-xl flex justify-between items-center text-amber-900 font-medium">
+              <span>المساحة المحسوبة للحفرة:</span>
+              <span className="font-extrabold text-amber-950 text-sm">{calculatedAreaM2} م²</span>
+            </div>
+          </div>
+
           {/* Backfill Volume Results Card */}
           <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">

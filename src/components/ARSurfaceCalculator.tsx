@@ -21,7 +21,7 @@ interface ARSurfaceCalculatorProps {
 
 export const ARSurfaceCalculator: React.FC<ARSurfaceCalculatorProps> = ({ engine }) => {
   const [points, setPoints] = useState<Point2D[]>([]);
-  const [surfaceAreaM2, setSurfaceAreaM2] = useState<number>(12.5); // Default sample area
+  const [surfaceAreaM2, setSurfaceAreaM2] = useState<number>(0); // Starts cleanly at 0 m2 until points placed
   
   // Strict sequence depth dropdown: 0.05m to 0.95m in 0.05m steps
   const [selectedDepthIndex, setSelectedDepthIndex] = useState<number>(1); // Default 0.10m

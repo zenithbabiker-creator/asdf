@@ -9,7 +9,9 @@ import {
   Smartphone, 
   Cpu, 
   CheckCircle2, 
-  AlertCircle 
+  AlertCircle,
+  Sprout,
+  Trees
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -33,14 +35,22 @@ export const Navbar: React.FC<NavbarProps> = ({
           
           {/* Logo & Main Title */}
           <div className="flex items-center space-x-3 space-x-reverse">
-            <div className="w-10 h-10 rounded-xl bg-emerald-600 flex items-center justify-center text-white shadow-xs">
-              <Ruler className="w-6 h-6 text-white" />
+            <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-emerald-500 via-teal-600 to-green-700 flex items-center justify-center text-white shadow-md shadow-emerald-600/20 ring-2 ring-emerald-500/20 relative">
+              <Sprout className="w-6 h-6 text-white transform -rotate-12" />
+              <div className="absolute -bottom-1 -right-1 bg-amber-500 text-slate-950 p-0.5 rounded-md border border-white">
+                <Ruler className="w-2.5 h-2.5" />
+              </div>
             </div>
             <div>
-              <h1 className="text-lg sm:text-xl font-bold tracking-tight text-slate-900">
-                {ARABIC_STRINGS.appTitle}
-              </h1>
-              <p className="text-xs text-slate-500 font-mono dir-ltr">
+              <div className="flex items-center gap-2">
+                <h1 className="text-xl sm:text-2xl font-black tracking-tight text-slate-900">
+                  {ARABIC_STRINGS.appTitle}
+                </h1>
+                <span className="bg-emerald-100 text-emerald-800 text-[10px] font-extrabold px-2 py-0.5 rounded-full border border-emerald-200">
+                  ZONE AR
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 font-mono dir-ltr font-medium">
                 {ARABIC_STRINGS.appSubtitle}
               </p>
             </div>

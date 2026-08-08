@@ -148,8 +148,12 @@ include(":app")
 
     <!-- AR & Camera Permissions -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
-    <uses-feature android:name="android.hardware.camera" android:required="true" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -192,8 +196,8 @@ include(":app")
     descriptionAr: 'النصوص الرسمية المترجمة بالكامل إلى اللغة العربية مع دعم RTL',
     content: `<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">حاسبة تربة الحدائق AR</string>
-    <string name="app_subtitle">Standalone AR Home Garden Landscape &amp; Soil Volume Calculator</string>
+    <string name="app_name">زون لتصاميم الحدائق</string>
+    <string name="app_subtitle">Zone Garden Designs &amp; AR Soil Calculator</string>
     
     <!-- Engine Detection -->
     <string name="engine_huawei">محرك Huawei AR Engine النشط (المكتبة المحلية ./huawei-ar-sdk/)</string>

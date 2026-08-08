@@ -54,8 +54,8 @@ export const DEFAULT_SOIL_TYPES: SoilType[] = [
 ];
 
 export const ARABIC_STRINGS = {
-  appTitle: 'حاسبة تربة الحدائق بالواقع المعزز',
-  appSubtitle: 'AR Home Garden Landscape & Soil Volume Calculator',
+  appTitle: 'زون لتصاميم الحدائق',
+  appSubtitle: 'Zone Garden Designs & AR Soil Calculator',
   dualEngineTitle: 'محرك الواقع المعزز النشط',
   googleArCore: 'Google ARCore',
   huaweiArEngine: 'Huawei AR Engine SDK',
