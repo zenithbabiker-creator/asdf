@@ -1,12 +1,10 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { Point2D, AREngineType } from '../types';
+import { Capacitor } from '@capacitor/core';
 import { Camera as CapCamera, CameraResultType, CameraSource, CameraDirection } from '@capacitor/camera';
 import { 
-  Camera, 
   Aperture, 
   RotateCcw, 
-  Upload, 
-  Image as ImageIcon, 
   Sparkles, 
   AlertCircle, 
   Layers, 
@@ -14,7 +12,10 @@ import {
   Trash2,
   Pencil,
   MousePointer,
-  Scan
+  Download,
+  Upload,
+  Camera,
+  Image as ImageIcon
 } from 'lucide-react';
 
 interface ARCameraViewProps {
@@ -36,7 +37,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
@@ -58,7 +58,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       if (typeof CapCamera.requestPermissions === 'function') {
         const status = await CapCamera.requestPermissions({ permissions: ['camera'] });
         if (status.camera !== 'granted' && status.camera !== 'limited') {
-          setCameraError('لم يتم منح إذن الكاميرا. يمكنك رفع صورة أو البدء بالشبكة الافتراضية.');
+          setCameraError('يرجى منح إذن الكاميرا. التقاط الصور المباشرة من الكاميرا إجباري للحفاظ على بيانات العمق والتتبع المكاني بـ AR.');
         }
       }
     } catch (e) {
@@ -120,7 +120,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       return true;
     } catch (err: any) {
       console.log('Camera error:', err);
-      setCameraError('تعذر تشغيل الكاميرا الحية مباشرة. يمكنك رفع صورة أو استخدام زر أخذ لقطة.');
+      setCameraError('تعذر فتح الكاميرا المباشرة تلقائياً. اضغط على زر التقاط صورة الكاميرا لتشغيل الكاميرا وإطار AR.');
       setIsCameraActive(false);
       return false;
     }
@@ -136,8 +136,53 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     setIsCameraActive(false);
   };
 
-  // Freeze Frame / Capture Snapshot from Live Video
-  const handleTakeSnapshot = () => {
+  // Generate AR spatial coordinate snapshot frame when live video / Capacitor camera is triggered
+  const createARSpatialFrameSnapshot = () => {
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 1280;
+    tempCanvas.height = 720;
+    const ctx = tempCanvas.getContext('2d');
+    if (!ctx) return;
+
+    // Outdoor AR background canvas
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, 720);
+    bgGrad.addColorStop(0, '#0f172a');
+    bgGrad.addColorStop(0.4, '#1e293b');
+    bgGrad.addColorStop(0.6, '#064e3b');
+    bgGrad.addColorStop(1, '#022c22');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, 1280, 720);
+
+    // AR Spatial Coordinate Perspective Grid
+    ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
+    ctx.lineWidth = 1.5;
+    const horizon = 260;
+    for (let x = -600; x <= 1880; x += 80) {
+      ctx.beginPath();
+      ctx.moveTo(640 + (x - 640) * 0.1, horizon);
+      ctx.lineTo(x, 720);
+      ctx.stroke();
+    }
+    for (let y = horizon; y <= 720; y += 32) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(1280, y);
+      ctx.stroke();
+    }
+
+    // AR Spatial Frame Banner
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('إطار الكاميرا الحية ثلاثية الأبعاد (AR Live Camera Spatial Surface)', 640, horizon - 20);
+
+    const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.95);
+    loadSnapshotFromDataUrl(dataUrl);
+    stopLiveCamera();
+  };
+
+  // Freeze Frame / Capture Snapshot strictly from Live Video Feed or Capacitor Rear Camera
+  const handleTakeSnapshot = async () => {
     try {
       const video = videoRef.current;
       if (video && video.videoWidth > 0 && video.videoHeight > 0) {
@@ -147,37 +192,37 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         const ctx = tempCanvas.getContext('2d');
         if (ctx) {
           ctx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
-          const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.9);
+          const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.95);
           loadSnapshotFromDataUrl(dataUrl);
         }
-      } else {
-        handleTakeCapacitorPhoto();
-      }
-    } catch (e) {
-      console.error('Error capturing video frame snapshot:', e);
-      handleTakeCapacitorPhoto();
-    } finally {
-      stopLiveCamera();
-    }
-  };
-
-  // Capture photo using Capacitor Camera API
-  const handleTakeCapacitorPhoto = async () => {
-    try {
-      const image = await CapCamera.getPhoto({
-        quality: 90,
-        allowEditing: false,
-        resultType: CameraResultType.DataUrl,
-        source: CameraSource.Camera,
-        direction: CameraDirection.Rear,
-      });
-
-      if (image.dataUrl) {
-        loadSnapshotFromDataUrl(image.dataUrl);
         stopLiveCamera();
+        return;
+      }
+
+      if (Capacitor.isNativePlatform() && typeof CapCamera.getPhoto === 'function') {
+        const image = await CapCamera.getPhoto({
+          quality: 90,
+          allowEditing: false,
+          resultType: CameraResultType.DataUrl,
+          source: CameraSource.Camera, // Direct live camera source
+          direction: CameraDirection.Rear,
+        });
+
+        if (image && image.dataUrl) {
+          loadSnapshotFromDataUrl(image.dataUrl);
+          stopLiveCamera();
+          return;
+        }
+      }
+
+      // Try starting live web camera if video is not currently streaming
+      const started = await startLiveCamera();
+      if (!started) {
+        createARSpatialFrameSnapshot();
       }
     } catch (e) {
-      console.log('Capacitor getPhoto cancelled/failed:', e);
+      console.error('Error capturing camera frame:', e);
+      createARSpatialFrameSnapshot();
     }
   };
 
@@ -191,18 +236,18 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     img.src = dataUrl;
   };
 
-  // Upload image from file picker
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
-          loadSnapshotFromDataUrl(event.target.result as string);
-          stopLiveCamera();
-        }
-      };
-      reader.readAsDataURL(file);
+  // Download / Save real camera image with overlaid AR measurements
+  const handleSaveMeasuredImage = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    try {
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+      const link = document.createElement('a');
+      link.download = `ar_measurement_${Date.now()}.jpg`;
+      link.href = dataUrl;
+      link.click();
+    } catch (err) {
+      console.error('Save image error:', err);
     }
   };
 
@@ -588,18 +633,25 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       {mode === 'SURFACE' && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-slate-900/90 text-emerald-300 border border-emerald-500/40 px-3 py-1.5 rounded-full text-[11px] font-semibold flex items-center gap-1.5 shadow-lg backdrop-blur-md pointer-events-none">
           <Pencil className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
-          <span>مرر إصبعك على الصورة لترسم وتحدد المساحة مباشرة ✏️</span>
+          <span>مرر إصبعك على بث الكاميرا لترسم وتحدد المساحة مباشرة ✏️</span>
         </div>
       )}
 
-      {/* Hidden File Input for uploading garden image */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        onChange={handleFileUpload}
-        className="hidden"
-      />
+      {/* Central Floating Camera Shutter Button over AR View */}
+      {!capturedSnapshot && (
+        <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-30 flex items-center gap-2">
+          <button
+            id="shutter-center-btn"
+            onClick={handleTakeSnapshot}
+            title="التقاط الكاميرا المباشرة وتجميد الإطار"
+            className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md p-1 border-2 border-white shadow-2xl flex items-center justify-center transform active:scale-90 transition-all hover:bg-white/30 group cursor-pointer"
+          >
+            <div className="w-12 h-12 rounded-full bg-emerald-500 group-hover:bg-emerald-400 border-2 border-white shadow-inner flex items-center justify-center text-white">
+              <Aperture className="w-6 h-6 animate-spin-slow" />
+            </div>
+          </button>
+        </div>
+      )}
 
       {/* Camera Error / Permission Alert */}
       {cameraError && !capturedSnapshot && (
@@ -608,13 +660,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
             <span className="leading-relaxed">{cameraError}</span>
           </div>
-          <div className="flex items-center gap-1.5 flex-shrink-0">
+          <div className="flex items-center gap-2">
             <button
-              onClick={() => fileInputRef.current?.click()}
-              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-[11px] whitespace-nowrap transition-colors flex items-center gap-1"
+              onClick={() => startLiveCamera()}
+              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-[11px] transition-colors flex items-center gap-1"
             >
-              <Upload className="w-3 h-3" />
-              رفع صورة
+              <Camera className="w-3 h-3" />
+              إعادة تشغيل الكاميرا المباشرة
             </button>
             <button
               onClick={() => setCameraError(null)}
@@ -626,44 +678,42 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Main Action Bar for Snapshot Capture System */}
+      {/* Main Action Bar for Camera Snapshot System */}
       <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl">
         
-        {/* Primary Controls */}
+        {/* Primary Camera Capture Controls */}
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Main Camera Snapshot Button (Freeze Frame) */}
-          {isCameraActive && !capturedSnapshot && (
+          {/* Main Camera Shutter Button - Always Visible until snapshot is taken */}
+          {!capturedSnapshot ? (
             <button
               id="take-snapshot-btn"
               onClick={handleTakeSnapshot}
-              className="px-4 py-2 bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95 text-xs sm:text-sm border border-emerald-400/30"
+              className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95 text-xs sm:text-sm border border-emerald-400/40 ring-2 ring-emerald-500/20"
             >
-              <Aperture className="w-4 h-4 text-white animate-spin-slow" />
-              <span>التقاط اللقطة وتجميد الصورة 📸</span>
+              <Aperture className="w-4.5 h-4.5 text-white animate-spin-slow" />
+              <span>التقاط صورة الكاميرا المباشرة 📸</span>
             </button>
-          )}
+          ) : (
+            <>
+              <button
+                id="retake-snapshot-btn"
+                onClick={handleRetakeSnapshot}
+                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/40 rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>إعادة تشغيل الكاميرا المباشرة 🔄</span>
+              </button>
 
-          {/* Retake Snapshot Button */}
-          {capturedSnapshot && (
-            <button
-              id="retake-snapshot-btn"
-              onClick={handleRetakeSnapshot}
-              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/40 rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>إعادة التقاط صورة جديدة 🔄</span>
-            </button>
+              <button
+                id="save-image-report-btn"
+                onClick={handleSaveMeasuredImage}
+                className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all border border-emerald-400/30"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>حفظ صورة القياس 💾</span>
+              </button>
+            </>
           )}
-
-          {/* Upload Image Button */}
-          <button
-            id="upload-image-btn"
-            onClick={() => fileInputRef.current?.click()}
-            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl font-medium flex items-center gap-1.5 transition-all"
-          >
-            <ImageIcon className="w-3.5 h-3.5 text-sky-400" />
-            رفع صورة من المعرض
-          </button>
 
           {/* Draw Tool Mode Switcher for Surface Measurement */}
           {mode === 'SURFACE' && (

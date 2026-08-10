@@ -26,7 +26,7 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Install Project Dependencies
+      - name: Install Dependencies
         run: |
           if [ -f package-lock.json ]; then
             npm ci
@@ -34,61 +34,33 @@ jobs:
             npm install
           fi
 
-      - name: Install Capacitor Packages
-        run: npm install @capacitor/core @capacitor/android @capacitor/camera @capacitor/cli --save
-
       - name: Build Vite Web App
         run: npm run build
 
-      - name: Prepare Capacitor & Android Project
+      - name: Convert Web App to Android (Capacitor)
         run: |
+          npm install @capacitor/core @capacitor/cli @capacitor/android
           if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
             npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
           fi
-
-          # إزالة أي مجلد android ناقص ثم إعادته نظيفاً
-          rm -rf android
-          npx cap add android
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
           npx cap sync android
 
-      - name: Generate App Icons
+      - name: Generate Default Icon for Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
+          
+          convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
 
-          SOURCE_ICON=""
-          for f in public/favicon.svg public/favicon.ico public/icon.png src/assets/icon.png; do
-            if [ -f "$f" ]; then
-              SOURCE_ICON="$f"
-              break
-            fi
-          done
-
-          if [ -n "$SOURCE_ICON" ]; then
-            convert "$SOURCE_ICON" -resize 512x512 icon-base.png
-          else
-            convert -size 512x512 xc:"#2E7D32" \
-              -fill "#4CAF50" -draw "circle 256,256 256,50" \
-              -fill white -font "DejaVu-Sans-Bold" -pointsize 260 -gravity center -draw "text 0,0 '🌿'" \
-              icon-base.png
-          fi
-
-          mkdir -p android/app/src/main/res/mipmap-mdpi \
-                   android/app/src/main/res/mipmap-hdpi \
-                   android/app/src/main/res/mipmap-xhdpi \
-                   android/app/src/main/res/mipmap-xxhdpi \
-                   android/app/src/main/res/mipmap-xxxhdpi
+          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
 
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-
-          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
-          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
-          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
-          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
-          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
 
       - name: Grant Execute Permission for Gradle
         working-directory: android
