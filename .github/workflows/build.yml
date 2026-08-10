@@ -55,31 +55,38 @@ jobs:
           # إنشاء صورة الأيقونة الافتراضية
           convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
 
-          # التأكد من وجود مجلدات الأيقونات وتوليد المقاسات
+          # إنشاء مجلدات الأيقونات
           mkdir -p android/app/src/main/res/mipmap-mdpi \
                    android/app/src/main/res/mipmap-hdpi \
                    android/app/src/main/res/mipmap-xhdpi \
                    android/app/src/main/res/mipmap-xxhdpi \
                    android/app/src/main/res/mipmap-xxxhdpi
 
+          # أيقونات عادية
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
-          # نسخة الأيقونة الدائرية (Round Launcher)
+          # أيقونات دائرية
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
 
-      - name: Grant Execute Permission & Build Android Debug APK
+      - name: Grant Execute Permission for Gradle
+        working-directory: android
         run: |
-          cd android
+          if [ ! -f gradlew ]; then
+            gradle wrapper
+          fi
           chmod +x gradlew
-          ./gradlew assembleDebug
+
+      - name: Build Android Debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
