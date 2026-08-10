@@ -5,7 +5,7 @@ export const STANDALONE_ANDROID_PROJECT_FILES: ProjectFile[] = [
     path: 'build.gradle.kts',
     name: 'build.gradle.kts (Project)',
     language: 'gradle',
-    descriptionAr: 'ملف إعدادات الجرادل الرئيسي للمشروع مع دعم لمكتبات أندرويد وCompose وARCore وHuawei AR SDK',
+    descriptionAr: 'ملف إعدادات الجرادل الرئيسي للمشروع مع دعم لمكتبات أندرويد وCompose وARCore وربط AAR لـ Huawei AR Engine من مجلد المكونات المحلية/assets/libs',
     content: `// Top-level build file where you can add configuration options common to all sub-projects/modules.
 plugins {
     alias(libs.plugins.android.application) apply false
@@ -17,9 +17,14 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        // Local directory repository for Huawei AR Engine AAR SDK at project root
+        // Local directory repositories for Huawei AR Engine AAR SDK (arenginesdk-4.0.0.5.aar)
         flatDir {
-            dirs(file("\${rootDir}/huawei-ar-sdk"), file("\${rootDir}/libs"))
+            dirs(
+                file("\${rootDir}/huawei-ar-sdk"),
+                file("\${rootDir}/libs"),
+                file("\${rootDir}/app/libs"),
+                file("\${rootDir}/app/src/main/assets")
+            )
         }
     }
 }
@@ -29,7 +34,7 @@ buildscript {
     path: 'app/build.gradle.kts',
     name: 'app/build.gradle.kts (App)',
     language: 'gradle',
-    descriptionAr: 'ملف الجرادل المخصص للتطبيق والذي يربط حزمة Huawei AR Engine AAR المحلية من المجلد الرئيسي لمشروع GitHub ورابط Google ARCore',
+    descriptionAr: 'ملف الجرادل المخصص للتطبيق والذي يربط ملف arenginesdk-4.0.0.5.aar المحلي المضاف يدوياً في مجلد assets أو libs أو huawei-ar-sdk مع Google ARCore',
     content: `plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -74,9 +79,14 @@ android {
 repositories {
     google()
     mavenCentral()
-    // Local Huawei SDK lookup relative to project root directory
+    // Local Huawei SDK lookup (arenginesdk-4.0.0.5.aar placed manually in assets/ / libs/ / huawei-ar-sdk/)
     flatDir {
-        dirs(file("\${rootDir}/huawei-ar-sdk"), file("\${rootDir}/libs"))
+        dirs(
+            file("\${rootDir}/huawei-ar-sdk"),
+            file("\${rootDir}/libs"),
+            file("libs"),
+            file("src/main/assets")
+        )
     }
 }
 
@@ -95,10 +105,12 @@ dependencies {
     // Google ARCore SDK
     implementation("com.google.ar:core:1.47.0")
 
-    // Local Huawei AR Engine SDK (Loaded from ./huawei-ar-sdk/ or ./libs/ in project root)
-    // Supports local .aar files placed at project root
+    // Local Huawei AR Engine SDK (arenginesdk-4.0.0.5.aar placed manually in assets/, libs/, or huawei-ar-sdk/)
+    // NO remote maven fetching used for Huawei AAR - loaded directly from local directories:
     implementation(fileTree(mapOf("dir" to "\${rootDir}/huawei-ar-sdk", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "\${rootDir}/libs", "include" to listOf("*.aar", "*.jar"))))
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar", "*.jar"))))
+    implementation(fileTree(mapOf("dir" to "src/main/assets", "include" to listOf("*.aar", "*.jar"))))
 }
 `,
   },
@@ -106,7 +118,7 @@ dependencies {
     path: 'settings.gradle.kts',
     name: 'settings.gradle.kts',
     language: 'gradle',
-    descriptionAr: 'تعريف مسارات المستودعات والمكتبات المحلية للمشروع',
+    descriptionAr: 'تعريف مسارات المستودعات والمكتبات المحلية لربط arenginesdk-4.0.0.5.aar المضاف يدوياً في assets/libs',
     content: `pluginManagement {
     repositories {
         google {
@@ -125,9 +137,14 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // Flat dir repository for local Huawei AR Engine AAR at root
+        // Flat dir repository for local Huawei AR Engine AAR (arenginesdk-4.0.0.5.aar)
         flatDir {
-            dirs(file("./huawei-ar-sdk"), file("./libs"))
+            dirs(
+                file("./huawei-ar-sdk"),
+                file("./libs"),
+                file("./app/libs"),
+                file("./app/src/main/assets")
+            )
         }
     }
 }
