@@ -52,9 +52,15 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           
+          # إنشاء صورة الأيقونة الافتراضية
           convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
 
-          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
+          # التأكد من وجود مجلدات الأيقونات وتوليد المقاسات
+          mkdir -p android/app/src/main/res/mipmap-mdpi \
+                   android/app/src/main/res/mipmap-hdpi \
+                   android/app/src/main/res/mipmap-xhdpi \
+                   android/app/src/main/res/mipmap-xxhdpi \
+                   android/app/src/main/res/mipmap-xxxhdpi
 
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
@@ -62,13 +68,18 @@ jobs:
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
-      - name: Grant Execute Permission for Gradle
-        working-directory: android
-        run: chmod +x gradlew
+          # نسخة الأيقونة الدائرية (Round Launcher)
+          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
+          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
+          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
+          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
+          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
 
-      - name: Build Android Debug APK
-        working-directory: android
-        run: ./gradlew assembleDebug
+      - name: Grant Execute Permission & Build Android Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
