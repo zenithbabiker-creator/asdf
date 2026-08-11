@@ -37,7 +37,7 @@ jobs:
       - name: Build Vite Web App
         run: npm run build
 
-      - name: Clean & Setup Capacitor Android Project
+      - name: Clean & Re-create Android Project
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
 
@@ -46,10 +46,10 @@ jobs:
             npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
           fi
 
-          # حذف مجلد أندرويد القديم/غير المكتمل لضمان إنشاء مشروع نظيف يحتوي على gradlew
+          # إزالة مجلد android غير المكتمل لضمان إنشاء مشروع أندرويد جديد بجميع ملفات gradlew
           rm -rf android
 
-          # إضافة منصة أندرويد من جديد بشكل كامل وصحيح
+          # إعادة إنشاء مشروع الأندرويد بالكامل
           npx cap add android
 
       - name: Generate Default Icon for Android
@@ -66,14 +66,14 @@ jobs:
                    android/app/src/main/res/mipmap-xxhdpi \
                    android/app/src/main/res/mipmap-xxxhdpi
 
-          # أيقونات عادية
+          # توليد الأيقونات القياسية
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
-          # أيقونات دائرية
+          # توليد الأيقونات الدائرية
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
