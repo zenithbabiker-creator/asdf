@@ -37,7 +37,7 @@ jobs:
       - name: Build Vite Web App
         run: npm run build
 
-      - name: Initialize Capacitor & Add Android Project
+      - name: Clean & Setup Capacitor Android Project
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
 
@@ -46,10 +46,11 @@ jobs:
             npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
           fi
 
-          # إضافة منصة أندرويد
-          if [ ! -d android ]; then
-            npx cap add android
-          fi
+          # حذف مجلد أندرويد القديم/غير المكتمل لضمان إنشاء مشروع نظيف يحتوي على gradlew
+          rm -rf android
+
+          # إضافة منصة أندرويد من جديد بشكل كامل وصحيح
+          npx cap add android
 
       - name: Generate Default Icon for Android
         run: |
