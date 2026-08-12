@@ -13,9 +13,11 @@ import {
   Pencil,
   MousePointer,
   Download,
-  Upload,
   Camera,
-  Image as ImageIcon
+  ChevronDown,
+  ChevronUp,
+  Sliders,
+  Maximize2
 } from 'lucide-react';
 
 interface ARCameraViewProps {
@@ -44,6 +46,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [showDepthHeatmap, setShowDepthHeatmap] = useState(true);
+
+  // UI State: Collapse toolbar to prevent obstructing drawing/measuring on captured snapshot
+  const [isToolbarCollapsed, setIsToolbarCollapsed] = useState(false);
+  const [showScaleSettings, setShowScaleSettings] = useState(false);
+
+  // Calibration scale: pixels per meter (default 220px = 1.0m for standard smartphone perspective at ~1.4m height)
+  const [pixelsPerMeter, setPixelsPerMeter] = useState<number>(220);
 
   // Simulated depth measurements for hole
   const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45); // meters
@@ -256,6 +265,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     setCapturedSnapshot(null);
     setSnapshotImageObj(null);
     setPoints([]);
+    setIsToolbarCollapsed(false);
     if (onAreaCalculated) onAreaCalculated(0);
     startLiveCamera();
   };
@@ -269,8 +279,8 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     };
   }, [mode]);
 
-  // Calculate polygon area in square meters using Shoelace Formula
-  const calculateAreaInM2 = (pts: Point2D[]) => {
+  // Calculate polygon area in square meters using Shoelace Formula & Dynamic Scale
+  const calculateAreaInM2 = (pts: Point2D[], scalePxPerM: number) => {
     if (pts.length < 3) return 0;
     let areaPx = 0;
     const n = pts.length;
@@ -280,9 +290,8 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       areaPx -= pts[j].x * pts[i].y;
     }
     areaPx = Math.abs(areaPx) / 2;
-    // Scale: 100 pixels = 1.0 meter
-    const pixelsPerMeter = 100;
-    const areaM2 = areaPx / (pixelsPerMeter * pixelsPerMeter);
+    // Area m² = Area px² / (scalePxPerM²)
+    const areaM2 = areaPx / (scalePxPerM * scalePxPerM);
     return Math.round(areaM2 * 100) / 100;
   };
 
@@ -294,6 +303,14 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   useEffect(() => {
     pointsRef.current = points;
   }, [points]);
+
+  // Recalculate area whenever pixelsPerMeter changes
+  useEffect(() => {
+    if (mode === 'SURFACE' && points.length >= 3 && onAreaCalculated) {
+      const area = calculateAreaInM2(points, pixelsPerMeter);
+      onAreaCalculated(area);
+    }
+  }, [pixelsPerMeter]);
 
   // Helper to extract canvas scaled coordinates from Pointer event
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -314,7 +331,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     return { x: clampedX, y: clampedY };
   };
 
-  // Start gesture drawing / touch down (PointerEvents API eliminates duplicate touchstart+mousedown triggers)
+  // Start gesture drawing / touch down
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (mode !== 'SURFACE') return;
     if (e.cancelable) e.preventDefault();
@@ -332,7 +349,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const newPts = [...pointsRef.current, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateAreaInM2(newPts);
+      const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
     } else {
       // TAP_POINTS mode with duplicate point protection
@@ -345,7 +362,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const newPts = [...currentPts, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateAreaInM2(newPts);
+      const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
     }
   };
@@ -368,7 +385,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const newPts = [...currentPts, coords];
     pointsRef.current = newPts;
 
-    const calculatedArea = calculateAreaInM2(newPts);
+    const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
     if (onAreaCalculated) onAreaCalculated(calculatedArea);
   };
 
@@ -392,13 +409,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const w = canvasRef.current.width;
     const h = canvasRef.current.height;
     const presetPts: Point2D[] = [
-      { x: w * 0.25, y: h * 0.30 },
-      { x: w * 0.75, y: h * 0.30 },
-      { x: w * 0.82, y: h * 0.75 },
-      { x: w * 0.18, y: h * 0.75 },
+      { x: w * 0.28, y: h * 0.32 },
+      { x: w * 0.72, y: h * 0.32 },
+      { x: w * 0.80, y: h * 0.72 },
+      { x: w * 0.20, y: h * 0.72 },
     ];
     setPoints(presetPts);
-    const calculatedArea = calculateAreaInM2(presetPts);
+    const calculatedArea = calculateAreaInM2(presetPts, pixelsPerMeter);
     if (onAreaCalculated) {
       onAreaCalculated(calculatedArea);
     }
@@ -460,6 +477,30 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         }
       }
 
+      // 2. AR Scale Reference Ruler Bar on Canvas (Bottom Left)
+      ctx.save();
+      const rulerLengthPx = pixelsPerMeter;
+      const rulerX = 16;
+      const rulerY = canvas.height - 20;
+      ctx.strokeStyle = '#34d399';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(rulerX, rulerY);
+      ctx.lineTo(rulerX + rulerLengthPx, rulerY);
+      // Ticks
+      ctx.moveTo(rulerX, rulerY - 6);
+      ctx.lineTo(rulerX, rulerY + 6);
+      ctx.moveTo(rulerX + rulerLengthPx, rulerY - 6);
+      ctx.lineTo(rulerX + rulerLengthPx, rulerY + 6);
+      ctx.stroke();
+
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(rulerX, rulerY - 24, 75, 18);
+      ctx.fillStyle = '#34d399';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillText('📐 1.0 متر', rulerX + 6, rulerY - 11);
+      ctx.restore();
+
       // AR Engine Badge
       ctx.save();
       ctx.fillStyle = engine === 'HUAWEI_AR_ENGINE' ? 'rgba(225, 29, 72, 0.85)' : 'rgba(2, 132, 199, 0.85)';
@@ -474,10 +515,10 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       if (capturedSnapshot) {
         ctx.save();
         ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
-        ctx.fillRect(12, 12, 145, 24);
+        ctx.fillRect(12, 12, 155, 24);
         ctx.fillStyle = '#ffffff';
         ctx.font = 'bold 11px sans-serif';
-        ctx.fillText('📷 تم التقاط اللقطة الثابتة', 20, 28);
+        ctx.fillText('📷 لقطة AR مكانية حية', 20, 28);
         ctx.restore();
       }
 
@@ -502,7 +543,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.setLineDash([]);
           }
 
-          // Draw Edges & Distance Labels
+          // Draw Edges & Real Distance Labels (calculated dynamically using pixelsPerMeter)
           ctx.font = 'bold 11px sans-serif';
           for (let i = 0; i < pts.length; i++) {
             const nextIdx = (i + 1) % pts.length;
@@ -516,16 +557,16 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               ctx.lineWidth = 2.5;
               ctx.stroke();
 
-              // Distance
+              // Distance using dynamic camera scale
               const distPx = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-              const distM = (distPx / 100).toFixed(2);
+              const distM = (distPx / pixelsPerMeter).toFixed(2);
 
               const midX = (p1.x + p2.x) / 2;
               const midY = (p1.y + p2.y) / 2;
               ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-              ctx.fillRect(midX - 24, midY - 11, 48, 22);
+              ctx.fillRect(midX - 26, midY - 11, 52, 22);
               ctx.fillStyle = '#34d399';
-              ctx.fillText(`${distM}م`, midX - 14, midY + 4);
+              ctx.fillText(`${distM}م`, midX - 16, midY + 4);
             }
           }
 
@@ -602,7 +643,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [mode, points, isCameraActive, capturedSnapshot, snapshotImageObj, engine, showDepthHeatmap, simulatedMaxDepth]);
+  }, [mode, points, isCameraActive, capturedSnapshot, snapshotImageObj, engine, showDepthHeatmap, simulatedMaxDepth, pixelsPerMeter]);
 
   return (
     <div className="relative w-full rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 shadow-xl min-h-[360px]">
@@ -634,6 +675,64 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-slate-900/90 text-emerald-300 border border-emerald-500/40 px-3 py-1.5 rounded-full text-[11px] font-semibold flex items-center gap-1.5 shadow-lg backdrop-blur-md pointer-events-none">
           <Pencil className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
           <span>مرر إصبعك على بث الكاميرا لترسم وتحدد المساحة مباشرة ✏️</span>
+        </div>
+      )}
+
+      {/* Scale Settings Drawer Toggle Button */}
+      <button
+        onClick={() => setShowScaleSettings(!showScaleSettings)}
+        className="absolute top-3 left-3 z-30 bg-slate-900/85 hover:bg-slate-800 text-emerald-300 border border-emerald-500/30 px-2.5 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md backdrop-blur-md transition-all"
+        title="معايرة مقياس الكاميرا"
+      >
+        <Sliders className="w-3.5 h-3.5" />
+        <span>المعايرة: 1م = {pixelsPerMeter}px</span>
+      </button>
+
+      {/* Scale Settings Popup Box */}
+      {showScaleSettings && (
+        <div className="absolute top-12 left-3 z-40 bg-slate-900/95 border border-slate-700 p-3.5 rounded-2xl text-xs text-slate-100 shadow-2xl backdrop-blur-md space-y-2.5 w-64">
+          <div className="flex items-center justify-between font-bold text-emerald-400 border-b border-slate-800 pb-1.5">
+            <span>معايرة مقياس الكاميرا الدقيق</span>
+            <button onClick={() => setShowScaleSettings(false)} className="text-slate-400 hover:text-white">✕</button>
+          </div>
+          <p className="text-[11px] text-slate-300">
+            حدد نسبة البكسل للمتر بناءً على ارتفاع الهاتف والمسافة للهدف:
+          </p>
+          <div className="space-y-1">
+            <div className="flex justify-between text-[11px] text-slate-400">
+              <span>مسافة واسعة (140px)</span>
+              <span>قريب جداً (350px)</span>
+            </div>
+            <input
+              type="range"
+              min="100"
+              max="350"
+              step="10"
+              value={pixelsPerMeter}
+              onChange={(e) => setPixelsPerMeter(parseInt(e.target.value))}
+              className="w-full accent-emerald-500 cursor-pointer"
+            />
+          </div>
+          <div className="grid grid-cols-3 gap-1 pt-1">
+            <button
+              onClick={() => setPixelsPerMeter(280)}
+              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 280 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
+            >
+              قريب (1م)
+            </button>
+            <button
+              onClick={() => setPixelsPerMeter(220)}
+              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 220 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
+            >
+              متوسط (1.5م)
+            </button>
+            <button
+              onClick={() => setPixelsPerMeter(150)}
+              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 150 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
+            >
+              واسع (3م)
+            </button>
+          </div>
         </div>
       )}
 
@@ -678,125 +777,160 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Main Action Bar for Camera Snapshot System */}
-      <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl">
-        
-        {/* Primary Camera Capture Controls */}
-        <div className="flex items-center gap-2 flex-wrap">
-          {/* Main Camera Shutter Button - Always Visible until snapshot is taken */}
-          {!capturedSnapshot ? (
-            <button
-              id="take-snapshot-btn"
-              onClick={handleTakeSnapshot}
-              className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95 text-xs sm:text-sm border border-emerald-400/40 ring-2 ring-emerald-500/20"
-            >
-              <Aperture className="w-4.5 h-4.5 text-white animate-spin-slow" />
-              <span>التقاط صورة الكاميرا المباشرة 📸</span>
-            </button>
+      {/* Floating Collapse / Expand Button for Toolbar when snapshot captured */}
+      {capturedSnapshot && (
+        <button
+          onClick={() => setIsToolbarCollapsed(!isToolbarCollapsed)}
+          className="absolute bottom-3 right-3 z-30 bg-slate-900/90 hover:bg-slate-800 text-emerald-400 border border-emerald-500/40 p-2 rounded-xl shadow-2xl backdrop-blur-md flex items-center gap-1.5 text-xs font-bold transition-all"
+          title={isToolbarCollapsed ? 'إظهار شريط الأدوات' : 'إخفاء شريط الأدوات لإلغاء الحجب'}
+        >
+          {isToolbarCollapsed ? (
+            <>
+              <ChevronUp className="w-4 h-4" />
+              <span>إظهار خيارات الصورة ⚙️</span>
+            </>
           ) : (
             <>
-              <button
-                id="retake-snapshot-btn"
-                onClick={handleRetakeSnapshot}
-                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/40 rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>إعادة تشغيل الكاميرا المباشرة 🔄</span>
-              </button>
-
-              <button
-                id="save-image-report-btn"
-                onClick={handleSaveMeasuredImage}
-                className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all border border-emerald-400/30"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>حفظ صورة القياس 💾</span>
-              </button>
+              <ChevronDown className="w-4 h-4" />
+              <span>إخفاء الشريط للتحديد على كامل الصورة 🔍</span>
             </>
           )}
+        </button>
+      )}
 
-          {/* Draw Tool Mode Switcher for Surface Measurement */}
-          {mode === 'SURFACE' && (
-            <div className="flex items-center p-0.5 bg-slate-950/80 border border-slate-700/80 rounded-xl">
+      {/* Main Action Bar for Camera Snapshot System (Collapsible to prevent blocking canvas) */}
+      {!isToolbarCollapsed && (
+        <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl max-h-40 overflow-y-auto">
+          
+          {/* Primary Camera Capture Controls */}
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Main Camera Shutter Button - Always Visible until snapshot is taken */}
+            {!capturedSnapshot ? (
               <button
-                id="tool-freehand-btn"
-                onClick={() => setDrawTool('FREEHAND')}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
-                  drawTool === 'FREEHAND'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                id="take-snapshot-btn"
+                onClick={handleTakeSnapshot}
+                className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white font-bold rounded-xl shadow-lg flex items-center gap-2 transition-all transform active:scale-95 text-xs sm:text-sm border border-emerald-400/40 ring-2 ring-emerald-500/20"
               >
-                <Pencil className="w-3 h-3" />
-                رسم حر بالإصبع
+                <Aperture className="w-4.5 h-4.5 text-white animate-spin-slow" />
+                <span>التقاط صورة الكاميرا المباشرة 📸</span>
               </button>
+            ) : (
+              <>
+                <button
+                  id="retake-snapshot-btn"
+                  onClick={handleRetakeSnapshot}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/40 rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>إعادة التقاط 🔄</span>
+                </button>
+
+                <button
+                  id="save-image-report-btn"
+                  onClick={handleSaveMeasuredImage}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-xl font-bold flex items-center gap-1.5 shadow-md text-xs transition-all border border-emerald-400/30"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>حفظ صورة القياس 💾</span>
+                </button>
+              </>
+            )}
+
+            {/* Draw Tool Mode Switcher for Surface Measurement */}
+            {mode === 'SURFACE' && (
+              <div className="flex items-center p-0.5 bg-slate-950/80 border border-slate-700/80 rounded-xl">
+                <button
+                  id="tool-freehand-btn"
+                  onClick={() => setDrawTool('FREEHAND')}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
+                    drawTool === 'FREEHAND'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Pencil className="w-3 h-3" />
+                  رسم حر
+                </button>
+                <button
+                  id="tool-tappoints-btn"
+                  onClick={() => setDrawTool('TAP_POINTS')}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
+                    drawTool === 'TAP_POINTS'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <MousePointer className="w-3 h-3" />
+                  تحديد زوايا
+                </button>
+              </div>
+            )}
+
+            {/* Preset Polygon on Snapshot */}
+            {mode === 'SURFACE' && (
               <button
-                id="tool-tappoints-btn"
-                onClick={() => setDrawTool('TAP_POINTS')}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
-                  drawTool === 'TAP_POINTS'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                id="preset-surface-btn"
+                onClick={handleAutoPresetSurface}
+                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 rounded-xl font-medium flex items-center gap-1 transition-all text-[11px]"
               >
-                <MousePointer className="w-3 h-3" />
-                تحديد نقاط الزوايا
+                <Focus className="w-3.5 h-3.5" />
+                شكل افتراضي
               </button>
-            </div>
-          )}
+            )}
 
-          {/* Preset Polygon on Snapshot */}
-          {mode === 'SURFACE' && (
-            <button
-              id="preset-surface-btn"
-              onClick={handleAutoPresetSurface}
-              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 rounded-xl font-medium flex items-center gap-1.5 transition-all"
-            >
-              <Focus className="w-3.5 h-3.5" />
-              تحديد شكل افتراضي
-            </button>
-          )}
+            {mode === 'HOLE_DEPTH' && (
+              <button
+                id="scan-hole-btn"
+                onClick={handleScanHole}
+                className="px-3 py-1.5 bg-amber-600 text-white hover:bg-amber-500 rounded-xl font-medium flex items-center gap-1.5 transition-all shadow-xs"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                مسح AR Depth
+              </button>
+            )}
+          </div>
 
-          {mode === 'HOLE_DEPTH' && (
-            <button
-              id="scan-hole-btn"
-              onClick={handleScanHole}
-              className="px-3 py-1.5 bg-amber-600 text-white hover:bg-amber-500 rounded-xl font-medium flex items-center gap-1.5 transition-all shadow-xs"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              مسح AR Depth للحفرة
-            </button>
-          )}
+          {/* Clear & Collapse Options */}
+          <div className="flex items-center gap-2">
+            {mode === 'SURFACE' && points.length > 0 && (
+              <button
+                id="clear-points-btn"
+                onClick={() => {
+                  setPoints([]);
+                  if (onAreaCalculated) onAreaCalculated(0);
+                }}
+                className="px-2.5 py-1.5 bg-rose-950/80 hover:bg-rose-900 text-rose-200 border border-rose-800 rounded-xl flex items-center gap-1 transition-all text-[11px]"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                تصفير ({points.length})
+              </button>
+            )}
+
+            {mode === 'HOLE_DEPTH' && (
+              <button
+                id="toggle-heatmap-btn"
+                onClick={() => setShowDepthHeatmap(!showDepthHeatmap)}
+                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl flex items-center gap-1 transition-all text-[11px]"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                {showDepthHeatmap ? 'إخفاء العمق' : 'إظهار العمق'}
+              </button>
+            )}
+
+            {/* Collapse toolbar toggle */}
+            {capturedSnapshot && (
+              <button
+                onClick={() => setIsToolbarCollapsed(true)}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition-all"
+                title="طي القائمة لتوسيع رؤية الصورة"
+              >
+                <ChevronDown className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
-
-        {/* Clear & Options */}
-        <div className="flex items-center gap-2">
-          {mode === 'SURFACE' && points.length > 0 && (
-            <button
-              id="clear-points-btn"
-              onClick={() => {
-                setPoints([]);
-                if (onAreaCalculated) onAreaCalculated(0);
-              }}
-              className="px-2.5 py-1.5 bg-rose-950/80 hover:bg-rose-900 text-rose-200 border border-rose-800 rounded-xl flex items-center gap-1 transition-all"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              تصفير النقاط ({points.length})
-            </button>
-          )}
-
-          {mode === 'HOLE_DEPTH' && (
-            <button
-              id="toggle-heatmap-btn"
-              onClick={() => setShowDepthHeatmap(!showDepthHeatmap)}
-              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl flex items-center gap-1 transition-all"
-            >
-              <Layers className="w-3.5 h-3.5" />
-              {showDepthHeatmap ? 'إخفاء العمق' : 'إظهار العمق'}
-            </button>
-          )}
-        </div>
-      </div>
+      )}
     </div>
   );
 };
+

@@ -37,57 +37,38 @@ jobs:
       - name: Build Vite Web App
         run: npm run build
 
-      - name: Clean & Re-create Android Project
+      - name: Convert Web App to Android (Capacitor)
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
-
-          # تهيئة Capacitor إذا لم يكن مهيئاً
           if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
             npx cap init "زون لتصاميم الحدائق" "com.zone.gardendesigns" --web-dir dist
           fi
-
-          # إزالة مجلد android غير المكتمل لضمان إنشاء مشروع أندرويد جديد بجميع ملفات gradlew
-          rm -rf android
-
-          # إعادة إنشاء مشروع الأندرويد بالكامل
-          npx cap add android
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android
 
       - name: Generate Default Icon for Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           
-          # إنشاء صورة الأيقونة الافتراضية
           convert -size 512x512 xc:"#10B981" -fill white -gravity center -pointsize 200 -draw "text 0,0 'Z'" icon-base.png
 
-          # إنشاء مجلدات الأيقونات
-          mkdir -p android/app/src/main/res/mipmap-mdpi \
-                   android/app/src/main/res/mipmap-hdpi \
-                   android/app/src/main/res/mipmap-xhdpi \
-                   android/app/src/main/res/mipmap-xxhdpi \
-                   android/app/src/main/res/mipmap-xxxhdpi
+          mkdir -p android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi
 
-          # توليد الأيقونات القياسية
           convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
           convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
-          # توليد الأيقونات الدائرية
-          convert icon-base.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png
-          convert icon-base.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png
-          convert icon-base.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
-          convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
-          convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
-
-      - name: Sync Capacitor Android
-        run: npx cap sync android
+      - name: Grant Execute Permission for Gradle
+        working-directory: android
+        run: chmod +x gradlew
 
       - name: Build Android Debug APK
         working-directory: android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
+        run: ./gradlew assembleDebug
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
