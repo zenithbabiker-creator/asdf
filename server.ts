@@ -12,47 +12,48 @@ async function startServer() {
 
   app.use(express.json());
 
-  // API Route: AI Soil Analysis via Gemini
+  // API Route: AI Garden & Turf Analysis via Gemini
   app.post('/api/ai-soil-analysis', async (req, res) => {
     try {
-      const { areaM2, depthM, soilType, plantCategory, customNotes } = req.body;
+      const { areaM2, seedlingsPerM2, plantCategory, customNotes } = req.body;
+      const countSeedlings = (areaM2 || 20) * (seedlingsPerM2 || 10);
 
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         // Return default structured response if key is missing
         return res.json({
-          summaryAr: `بناءً على مساحة ${areaM2} م² وعمق ${depthM} م، يحتاج الموقع إلى خلطة تربة غنية جيدة الصرف ومناسبة لـ (${plantCategory}).`,
+          summaryAr: `بناءً على مساحة الحديقة ${areaM2} م² وعدد شتول النجيلة المختارة ${seedlingsPerM2 || 10} شتلة/م²، تم إعداد التوصيات الفنية للزراعة والعدد الكلي المطلوب (${countSeedlings} شتلة).`,
           soilPreparationStepsAr: [
-            'تنظيف الموقع من الحجارة والأعشاب الضارة.',
-            'خلط 70% تربة زراعية خفيفة مع 20% بيتموس و10% سماد عضوي معالج.',
-            'تسوية السطح ورش الماء الخفيف لترسيب الهواء من الحفرة قبل الزراعة.',
+            'تنظيف وتسوية الأرض وإزالة الأحجار والتربة غير المستوية.',
+            'فرش طبقة الرمل الزراعي الخفيف أو البيتموس بسمك مناسب قبل غرست الشتول.',
+            'دك السطح وتمرير البكرات الخفيفة لضمان استواء سطح النجيلة.',
           ],
           recommendedAdditivesAr: [
-            'سماد عضوي معالج حرارياً خالي من بذور النجيل.',
-            'مادة البيتموس (Peat Moss) لحفظ الرطوبة.',
-            'بيرلايت (Perlite) تحسين التهوية والصرف.',
+            'استخدام محددات النباتات العريضة (30سم، 20سم، 10سم) للفصل بين أصناف الزهور والنجيل.',
+            'توفير نظام ري بالتنقيط للمحددات وري بالرشاشات للمساحة المتبقية من النجيلة.',
           ],
-          fertilizerTipsAr: 'يرجى الري الخفيف مرتين يومياً خلال الأسبوع الأول ثم الاعتماد على جدول الري حسب الموسم.',
-          estimatedBagCount50L: Math.ceil(((areaM2 * depthM) * 1000) / 50),
+          fertilizerTipsAr: 'يرجى الري الخفيف مرتين يومياً خلال الأسبوع الأول بعد غرس شتول النجيلة حتى تتجذر العروق.',
+          estimatedTurfM2: areaM2,
+          estimatedTotalSeedlings: countSeedlings,
         });
       }
 
       const ai = new GoogleGenAI({ apiKey });
-      const prompt = `أنت خبير هندسة حدائق وتربة زراعية.
-العميل يرغب بتجهيز حديقة بالمواصفات التالية:
-- المساحة السطحية: ${areaM2} متر مربع
-- عمق التربة المطلوب: ${depthM} متر
-- نوع التربة الحالي: ${soilType}
-- نوع المزروعات: ${plantCategory}
+      const prompt = `أنت خبير هندسة حدائق وتصميم لاندسكيب.
+العميل يرغب بتصميم حديقة بالمواصفات التالية:
+- المساحة السطحية المتبقية للنجيلة: ${areaM2} متر مربع
+- عدد شتول النجيلة في المتر المربع: ${seedlingsPerM2} شتلة/م² (العدد الكلي: ${countSeedlings} شتلة)
+- نوع المزروعات والأصناف للمحددات: ${plantCategory}
 - ملاحظات إضافية: ${customNotes || 'لا يوجد'}
 
 قدم إجابة باللغة العربية بتنسيق JSON يحتوي على الحقول التالية فقط:
 {
-  "summaryAr": "ملخص شامل ومختصر للتوصية",
+  "summaryAr": "ملخص شامل ومختصر لتنفيذ وزراعة شتول النجيلة بالحديقة",
   "soilPreparationStepsAr": ["خطوة 1", "خطوة 2", "خطوة 3"],
-  "recommendedAdditivesAr": ["مكون 1", "مكون 2"],
-  "fertilizerTipsAr": "نصائح الري والتسميد المبدئي",
-  "estimatedBagCount50L": عدد الأكياس سعة 50 ليتر
+  "recommendedAdditivesAr": ["توصية 1", "توصية 2"],
+  "fertilizerTipsAr": "نصائح الري والعناية بالنجيلة والمحددات",
+  "estimatedTurfM2": المساحة المطلوبة للنجيلة,
+  "estimatedTotalSeedlings": العدد الكلي لشتول النجيلة
 }`;
 
       const response = await ai.models.generateContent({
@@ -69,15 +70,17 @@ async function startServer() {
     } catch (err: any) {
       console.error('Gemini API Error:', err);
       // Fallback response on error
+      const countSeedlingsFallback = (req.body.areaM2 || 20) * (req.body.seedlingsPerM2 || 10);
       return res.json({
-        summaryAr: `تم حساب التوصية للحديقة بمساحة ${req.body.areaM2 || 10} م² وعمق ${req.body.depthM || 0.2} م.`,
+        summaryAr: `تم حساب التوصية للحديقة بمساحة ${req.body.areaM2 || 20} م² وعدد الشتول ${req.body.seedlingsPerM2 || 10} شتلة/م² (الإجمالي: ${countSeedlingsFallback} شتلة).`,
         soilPreparationStepsAr: [
-          'تنظيف مكان الغرس ودك التربة المبدئية.',
-          'إضافة التربة الزراعية بالتساوي مع دك خفيف.',
+          'تنظيف وتسوية مكان الفرد ودك الأرض المبدئية.',
+          'غرس شتول النجيلة بالتساوي ورشها بالماء الخفيف.',
         ],
-        recommendedAdditivesAr: ['سماد عضوي معالج', 'بيتموس'],
-        fertilizerTipsAr: 'الري بانتظام صباحاً أو مساءً.',
-        estimatedBagCount50L: Math.ceil((((req.body.areaM2 || 10) * (req.body.depthM || 0.2)) * 1000) / 50),
+        recommendedAdditivesAr: ['محددات ألومنيوم/بلاستيكية لحجب أحواض الزهور', 'سماد عضوي معالج'],
+        fertilizerTipsAr: 'الري بانتظام صباحاً ومساءً.',
+        estimatedTurfM2: req.body.areaM2 || 20,
+        estimatedTotalSeedlings: countSeedlingsFallback,
       });
     }
   });

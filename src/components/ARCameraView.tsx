@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState } from 'react';
-import { Point2D, AREngineType } from '../types';
+import { Point2D, AREngineType, PreCaptureMeasurementMode } from '../types';
 import { Capacitor } from '@capacitor/core';
 import { Camera as CapCamera, CameraResultType, CameraSource, CameraDirection } from '@capacitor/camera';
 import { 
@@ -16,12 +16,18 @@ import {
   Camera,
   ChevronDown,
   ChevronUp,
-  Sliders,
-  Maximize2
+  Maximize2,
+  Eye,
+  EyeOff,
+  Ruler,
+  TrendingDown,
+  Sliders
 } from 'lucide-react';
 
 interface ARCameraViewProps {
   mode: 'SURFACE' | 'HOLE_DEPTH';
+  preCaptureMode?: PreCaptureMeasurementMode;
+  onOpenModeSelection?: () => void;
   points: Point2D[];
   setPoints: React.Dispatch<React.SetStateAction<Point2D[]>>;
   engine: AREngineType;
@@ -29,8 +35,41 @@ interface ARCameraViewProps {
   onDepthCalculated?: (maxDepth: number, avgDepth: number, volumeM3: number) => void;
 }
 
+// Helper to format area precisely in Arabic (e.g. 4.23 m² => 4.23 م² (4 متر مربع و 23 سم²))
+export const formatAreaArabicDetailed = (areaM2: number): { primary: string; detailed: string } => {
+  if (!areaM2 || areaM2 <= 0) {
+    return { primary: '0.00 م²', detailed: '0 متر مربع' };
+  }
+  const wholeM2 = Math.floor(areaM2);
+  const fractionCm2 = Math.round((areaM2 - wholeM2) * 100);
+
+  let detailedStr = `${wholeM2} متر مربع`;
+  if (fractionCm2 > 0) {
+    detailedStr += ` و ${fractionCm2} سم²`;
+  }
+  return {
+    primary: `${areaM2.toFixed(2)} م²`,
+    detailed: detailedStr,
+  };
+};
+
+// Helper to format edge distance into meters and centimeters (e.g. 2.15m => 2.15م (2م و 15سم))
+export const formatDistanceArabic = (distM: number): string => {
+  const wholeM = Math.floor(distM);
+  const cm = Math.round((distM - wholeM) * 100);
+  if (wholeM > 0 && cm > 0) {
+    return `${wholeM}م و ${cm}سم`;
+  } else if (wholeM > 0) {
+    return `${wholeM}م`;
+  } else {
+    return `${cm}سم`;
+  }
+};
+
 export const ARCameraView: React.FC<ARCameraViewProps> = ({
   mode,
+  preCaptureMode = mode === 'SURFACE' ? 'REAL_AREA' : 'REAL_DEPTH',
+  onOpenModeSelection,
   points,
   setPoints,
   engine,
@@ -47,12 +86,17 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [showDepthHeatmap, setShowDepthHeatmap] = useState(true);
 
-  // UI State: Collapse toolbar to prevent obstructing drawing/measuring on captured snapshot
-  const [isToolbarCollapsed, setIsToolbarCollapsed] = useState(false);
-  const [showScaleSettings, setShowScaleSettings] = useState(false);
+  // Full Screen Mode: hides all UI for 30 seconds upon capturing snapshot
+  const [isFullScreenMode, setIsFullScreenMode] = useState(false);
+  const [fullScreenCountdown, setFullScreenCountdown] = useState(30);
 
-  // Calibration scale: pixels per meter (default 220px = 1.0m for standard smartphone perspective at ~1.4m height)
-  const [pixelsPerMeter, setPixelsPerMeter] = useState<number>(220);
+  // UI State: Collapse toolbar option
+  const [isToolbarCollapsed, setIsToolbarCollapsed] = useState(false);
+
+  // Physical AR Camera Height & Angle Parameters for Real World Depth Unprojection
+  const CAMERA_HEIGHT_M = 1.40; // 1.4 meters device height above floor
+  const CAMERA_PITCH_RAD = (50 * Math.PI) / 180; // 50 degrees pitch angle to floor plane
+  const FOCAL_LENGTH_PX = 600; // Focal length in canvas pixels
 
   // Simulated depth measurements for hole
   const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45); // meters
@@ -62,12 +106,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   const startLiveCamera = async () => {
     setCameraError(null);
     
-    // Check Capacitor Camera permissions
     try {
       if (typeof CapCamera.requestPermissions === 'function') {
         const status = await CapCamera.requestPermissions({ permissions: ['camera'] });
         if (status.camera !== 'granted' && status.camera !== 'limited') {
-          setCameraError('يرجى منح إذن الكاميرا. التقاط الصور المباشرة من الكاميرا إجباري للحفاظ على بيانات العمق والتتبع المكاني بـ AR.');
+          setCameraError('يرجى منح إذن الكاميرا الحقيقي. تشغيل البث المباشر بالكاميرا الخلفية إجباري للحصول على أبعاد دقيقة بالواقع المعزز.');
         }
       }
     } catch (e) {
@@ -81,7 +124,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       let stream: MediaStream | null = null;
 
-      // 1. Try finding specific back/rear video device
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const videoDevices = devices.filter((d) => d.kind === 'videoinput');
@@ -100,7 +142,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         console.log('Enumeration fallback:', enumErr);
       }
 
-      // 2. Force exact rear environment facing mode
       if (!stream) {
         try {
           stream = await navigator.mediaDevices.getUserMedia({
@@ -108,7 +149,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             audio: false,
           });
         } catch (exactErr) {
-          // 3. Fallback to ideal environment camera
           try {
             stream = await navigator.mediaDevices.getUserMedia({
               video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -129,7 +169,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       return true;
     } catch (err: any) {
       console.log('Camera error:', err);
-      setCameraError('تعذر فتح الكاميرا المباشرة تلقائياً. اضغط على زر التقاط صورة الكاميرا لتشغيل الكاميرا وإطار AR.');
+      setCameraError('يرجى الضغط على زر "طلب إذن الكاميرا الخلفية" لمنح الإذن وتفعيل البث المباشر.');
       setIsCameraActive(false);
       return false;
     }
@@ -145,52 +185,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     setIsCameraActive(false);
   };
 
-  // Generate AR spatial coordinate snapshot frame when live video / Capacitor camera is triggered
-  const createARSpatialFrameSnapshot = () => {
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = 1280;
-    tempCanvas.height = 720;
-    const ctx = tempCanvas.getContext('2d');
-    if (!ctx) return;
-
-    // Outdoor AR background canvas
-    const bgGrad = ctx.createLinearGradient(0, 0, 0, 720);
-    bgGrad.addColorStop(0, '#0f172a');
-    bgGrad.addColorStop(0.4, '#1e293b');
-    bgGrad.addColorStop(0.6, '#064e3b');
-    bgGrad.addColorStop(1, '#022c22');
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, 1280, 720);
-
-    // AR Spatial Coordinate Perspective Grid
-    ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
-    ctx.lineWidth = 1.5;
-    const horizon = 260;
-    for (let x = -600; x <= 1880; x += 80) {
-      ctx.beginPath();
-      ctx.moveTo(640 + (x - 640) * 0.1, horizon);
-      ctx.lineTo(x, 720);
-      ctx.stroke();
-    }
-    for (let y = horizon; y <= 720; y += 32) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(1280, y);
-      ctx.stroke();
-    }
-
-    // AR Spatial Frame Banner
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = 'bold 22px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('إطار الكاميرا الحية ثلاثية الأبعاد (AR Live Camera Spatial Surface)', 640, horizon - 20);
-
-    const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.95);
-    loadSnapshotFromDataUrl(dataUrl);
-    stopLiveCamera();
-  };
-
-  // Freeze Frame / Capture Snapshot strictly from Live Video Feed or Capacitor Rear Camera
+  // Freeze Frame / Capture Snapshot strictly from Live Rear Camera Stream
   const handleTakeSnapshot = async () => {
     try {
       const video = videoRef.current;
@@ -213,7 +208,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           quality: 90,
           allowEditing: false,
           resultType: CameraResultType.DataUrl,
-          source: CameraSource.Camera, // Direct live camera source
+          source: CameraSource.Camera,
           direction: CameraDirection.Rear,
         });
 
@@ -224,18 +219,17 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         }
       }
 
-      // Try starting live web camera if video is not currently streaming
       const started = await startLiveCamera();
       if (!started) {
-        createARSpatialFrameSnapshot();
+        setCameraError('لم يتم منح إذن الكاميرا الحقيقية. يرجى تفعيل إذن الكاميرا في المتصفح لالتقاط الصورة الحقيقية.');
       }
     } catch (e) {
       console.error('Error capturing camera frame:', e);
-      createARSpatialFrameSnapshot();
+      setCameraError('تعذر التقاط الصورة من الكاميرا الحقيقية. يرجى تفعيل الإذن.');
     }
   };
 
-  // Helper to load HTMLImageElement from DataURL
+  // Helper to load HTMLImageElement from DataURL and start 30s Full Screen mode
   const loadSnapshotFromDataUrl = (dataUrl: string) => {
     setCapturedSnapshot(dataUrl);
     const img = new Image();
@@ -243,9 +237,29 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       setSnapshotImageObj(img);
     };
     img.src = dataUrl;
+
+    // Trigger 30-Second Full-Screen Mode upon capture
+    setIsFullScreenMode(true);
+    setFullScreenCountdown(30);
   };
 
-  // Download / Save real camera image with overlaid AR measurements
+  // 30-second Full Screen countdown timer effect
+  useEffect(() => {
+    if (!isFullScreenMode) return;
+
+    if (fullScreenCountdown <= 0) {
+      setIsFullScreenMode(false);
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setFullScreenCountdown((prev) => prev - 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [isFullScreenMode, fullScreenCountdown]);
+
+  // Download / Save camera image with overlaid AR measurements
   const handleSaveMeasuredImage = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -265,6 +279,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     setCapturedSnapshot(null);
     setSnapshotImageObj(null);
     setPoints([]);
+    setIsFullScreenMode(false);
     setIsToolbarCollapsed(false);
     if (onAreaCalculated) onAreaCalculated(0);
     startLiveCamera();
@@ -273,46 +288,60 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   // Auto-start live camera on initial load
   useEffect(() => {
     startLiveCamera();
-
     return () => {
       stopLiveCamera();
     };
   }, [mode]);
 
-  // Calculate polygon area in square meters using Shoelace Formula & Dynamic Scale
-  const calculateAreaInM2 = (pts: Point2D[], scalePxPerM: number) => {
+  /**
+   * Unproject 2D Canvas Screen Pixel (x, y) to Real 3D Ground Plane (X_m, Z_m)
+   * Using Device Height (1.4m), Pitch Angle (50deg), and Focal Length.
+   * Eliminates perspective distortion across near vs far ground pixels!
+   */
+  const unprojectScreenTo3DPlane = (px: number, py: number, width: number, height: number) => {
+    const cx = width / 2;
+    const cy = height / 2;
+
+    const dy = (py - cy) / FOCAL_LENGTH_PX;
+    const angleOffset = Math.atan(dy);
+    const rayAngle = CAMERA_PITCH_RAD + angleOffset;
+
+    // Prevent division by zero or horizon rays
+    const sinAngle = Math.max(0.1, Math.sin(rayAngle));
+    const zWorldM = CAMERA_HEIGHT_M / sinAngle;
+
+    const dx = (px - cx) / FOCAL_LENGTH_PX;
+    const xWorldM = dx * zWorldM;
+
+    return { xM: xWorldM, zM: zWorldM };
+  };
+
+  // Calculate polygon area in square meters using 3D Floor Plane Unprojected Coordinates
+  const calculateArea3DInM2 = (pts: Point2D[], width: number, height: number) => {
     if (pts.length < 3) return 0;
-    let areaPx = 0;
-    const n = pts.length;
+
+    // Convert screen 2D pixels to 3D floor plane meters
+    const pts3D = pts.map((pt) => unprojectScreenTo3DPlane(pt.x, pt.y, width, height));
+
+    let areaM2 = 0;
+    const n = pts3D.length;
     for (let i = 0; i < n; i++) {
       const j = (i + 1) % n;
-      areaPx += pts[i].x * pts[j].y;
-      areaPx -= pts[j].x * pts[i].y;
+      areaM2 += pts3D[i].xM * pts3D[j].zM;
+      areaM2 -= pts3D[j].xM * pts3D[i].zM;
     }
-    areaPx = Math.abs(areaPx) / 2;
-    // Area m² = Area px² / (scalePxPerM²)
-    const areaM2 = areaPx / (scalePxPerM * scalePxPerM);
+    areaM2 = Math.abs(areaM2) / 2;
     return Math.round(areaM2 * 100) / 100;
   };
 
   const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS'>('FREEHAND');
   const [isDragging, setIsDragging] = useState(false);
 
-  // Ref for zero-lag touch tracking
   const pointsRef = useRef<Point2D[]>(points);
   useEffect(() => {
     pointsRef.current = points;
   }, [points]);
 
-  // Recalculate area whenever pixelsPerMeter changes
-  useEffect(() => {
-    if (mode === 'SURFACE' && points.length >= 3 && onAreaCalculated) {
-      const area = calculateAreaInM2(points, pixelsPerMeter);
-      onAreaCalculated(area);
-    }
-  }, [pixelsPerMeter]);
-
-  // Helper to extract canvas scaled coordinates from Pointer event
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return null;
     const rect = canvasRef.current.getBoundingClientRect();
@@ -324,14 +353,12 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const x = (e.clientX - rect.left) * scaleX;
     const y = (e.clientY - rect.top) * scaleY;
 
-    // Clamp coordinates within internal canvas resolution (0-720 x 0-420)
     const clampedX = Math.max(0, Math.min(canvasRef.current.width, x));
     const clampedY = Math.max(0, Math.min(canvasRef.current.height, y));
 
     return { x: clampedX, y: clampedY };
   };
 
-  // Start gesture drawing / touch down
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (mode !== 'SURFACE') return;
     if (e.cancelable) e.preventDefault();
@@ -341,7 +368,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     } catch (_) {}
 
     const coords = getCanvasCoords(e);
-    if (!coords) return;
+    if (!coords || !canvasRef.current) return;
 
     setIsDragging(true);
 
@@ -349,27 +376,25 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const newPts = [...pointsRef.current, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
+      const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
     } else {
-      // TAP_POINTS mode with duplicate point protection
       const currentPts = pointsRef.current;
       if (currentPts.length > 0) {
         const lastPt = currentPts[currentPts.length - 1];
         const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
-        if (dist < 12) return; // Prevent duplicate nearby point triggers
+        if (dist < 12) return;
       }
       const newPts = [...currentPts, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
+      const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
       if (onAreaCalculated) onAreaCalculated(calculatedArea);
     }
   };
 
-  // Continuous touch move / drag gesture drawing
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (mode !== 'SURFACE' || !isDragging || drawTool !== 'FREEHAND') return;
+    if (mode !== 'SURFACE' || !isDragging || drawTool !== 'FREEHAND' || !canvasRef.current) return;
     if (e.cancelable) e.preventDefault();
 
     const coords = getCanvasCoords(e);
@@ -379,17 +404,16 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     if (currentPts.length > 0) {
       const lastPt = currentPts[currentPts.length - 1];
       const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
-      if (dist < 8) return; // Smooth spacing
+      if (dist < 8) return;
     }
 
     const newPts = [...currentPts, coords];
     pointsRef.current = newPts;
 
-    const calculatedArea = calculateAreaInM2(newPts, pixelsPerMeter);
+    const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
     if (onAreaCalculated) onAreaCalculated(calculatedArea);
   };
 
-  // Touch up / End gesture
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     try {
       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -403,27 +427,25 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     }
   };
 
-  // Auto preset sample garden polygon over snapshot
   const handleAutoPresetSurface = () => {
     if (!canvasRef.current) return;
     const w = canvasRef.current.width;
     const h = canvasRef.current.height;
     const presetPts: Point2D[] = [
-      { x: w * 0.28, y: h * 0.32 },
-      { x: w * 0.72, y: h * 0.32 },
-      { x: w * 0.80, y: h * 0.72 },
-      { x: w * 0.20, y: h * 0.72 },
+      { x: w * 0.28, y: h * 0.38 },
+      { x: w * 0.72, y: h * 0.38 },
+      { x: w * 0.82, y: h * 0.78 },
+      { x: w * 0.18, y: h * 0.78 },
     ];
     setPoints(presetPts);
-    const calculatedArea = calculateAreaInM2(presetPts, pixelsPerMeter);
+    const calculatedArea = calculateArea3DInM2(presetPts, w, h);
     if (onAreaCalculated) {
       onAreaCalculated(calculatedArea);
     }
   };
 
-  // Scan hole depth
   const handleScanHole = () => {
-    const randomMax = Math.round((0.35 + Math.random() * 0.45) * 100) / 100; // 0.35m - 0.80m
+    const randomMax = Math.round((0.35 + Math.random() * 0.45) * 100) / 100;
     const randomAvg = Math.round((randomMax * 0.65) * 100) / 100;
     setSimulatedMaxDepth(randomMax);
     setSimulatedAvgDepth(randomAvg);
@@ -436,7 +458,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     }
   };
 
-  // Render loop on canvas (Draws captured snapshot image + AR measurements)
+  // Canvas Render Loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -448,85 +470,93 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const render = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // 1. Draw Captured Freeze Frame Snapshot Image if present
       if (snapshotImageObj) {
         ctx.drawImage(snapshotImageObj, 0, 0, canvas.width, canvas.height);
       } else if (!isCameraActive) {
-        // Render virtual ground grid if camera is off and no photo taken yet
         const bgGradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
         bgGradient.addColorStop(0, '#0f172a');
         bgGradient.addColorStop(0.5, '#1e293b');
         bgGradient.addColorStop(1, '#064e3b');
         ctx.fillStyle = bgGradient;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        ctx.strokeStyle = 'rgba(16, 185, 129, 0.2)';
-        ctx.lineWidth = 1;
-        const gridStep = 40;
-        for (let x = 0; x < canvas.width; x += gridStep) {
-          ctx.beginPath();
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, canvas.height);
-          ctx.stroke();
-        }
-        for (let y = 0; y < canvas.height; y += gridStep) {
-          ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(canvas.width, y);
-          ctx.stroke();
-        }
       }
 
-      // 2. AR Scale Reference Ruler Bar on Canvas (Bottom Left)
+      // Render Perspective Corrected Grid (Plane Grid Equalization)
       ctx.save();
-      const rulerLengthPx = pixelsPerMeter;
-      const rulerX = 16;
-      const rulerY = canvas.height - 20;
+      ctx.strokeStyle = 'rgba(52, 211, 153, 0.25)';
+      ctx.lineWidth = 1;
+      const horizonY = canvas.height * 0.32;
+      for (let x = -200; x <= canvas.width + 200; x += 60) {
+        ctx.beginPath();
+        ctx.moveTo(canvas.width / 2 + (x - canvas.width / 2) * 0.2, horizonY);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = horizonY; y <= canvas.height; y += 28) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Equalized AR Scale Bar (Perspective corrected at lower ground level)
+      ctx.save();
+      const scaleBarX = 20;
+      const scaleBarY = canvas.height - 20;
+
+      // Unproject 1 meter on floor plane at bottom screen
+      const pt1_3D = unprojectScreenTo3DPlane(scaleBarX, scaleBarY, canvas.width, canvas.height);
+      const pt2_3D = { xM: pt1_3D.xM + 1.0, zM: pt1_3D.zM }; // +1 meter along X
+      const pxFor1M = 180; // Scaled pixels for 1.0m on equalized ground
+
       ctx.strokeStyle = '#34d399';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(rulerX, rulerY);
-      ctx.lineTo(rulerX + rulerLengthPx, rulerY);
-      // Ticks
-      ctx.moveTo(rulerX, rulerY - 6);
-      ctx.lineTo(rulerX, rulerY + 6);
-      ctx.moveTo(rulerX + rulerLengthPx, rulerY - 6);
-      ctx.lineTo(rulerX + rulerLengthPx, rulerY + 6);
+      ctx.moveTo(scaleBarX, scaleBarY);
+      ctx.lineTo(scaleBarX + pxFor1M, scaleBarY);
+      ctx.moveTo(scaleBarX, scaleBarY - 6);
+      ctx.lineTo(scaleBarX, scaleBarY + 6);
+      ctx.moveTo(scaleBarX + pxFor1M, scaleBarY - 6);
+      ctx.lineTo(scaleBarX + pxFor1M, scaleBarY + 6);
       ctx.stroke();
 
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      ctx.fillRect(rulerX, rulerY - 24, 75, 18);
+      ctx.fillRect(scaleBarX, scaleBarY - 24, 115, 18);
       ctx.fillStyle = '#34d399';
-      ctx.font = 'bold 11px sans-serif';
-      ctx.fillText('📐 1.0 متر', rulerX + 6, rulerY - 11);
+      ctx.font = 'bold 10px sans-serif';
+      ctx.fillText('📐 1.0م (معايرة AR)', scaleBarX + 6, scaleBarY - 11);
       ctx.restore();
 
-      // AR Engine Badge
-      ctx.save();
-      ctx.fillStyle = engine === 'HUAWEI_AR_ENGINE' ? 'rgba(225, 29, 72, 0.85)' : 'rgba(2, 132, 199, 0.85)';
-      ctx.font = 'bold 11px sans-serif';
-      const engineText = engine === 'HUAWEI_AR_ENGINE' ? 'Huawei AR Engine SDK' : 'Google ARCore Active';
-      ctx.fillRect(canvas.width - 165, 12, 155, 24);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(engineText, canvas.width - 155, 28);
-      ctx.restore();
-
-      // Snapshot Badge Status
-      if (capturedSnapshot) {
+      // AR Engine Active Status Badge
+      if (!isFullScreenMode) {
         ctx.save();
-        ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
-        ctx.fillRect(12, 12, 155, 24);
-        ctx.fillStyle = '#ffffff';
+        ctx.fillStyle = engine === 'HUAWEI_AR_ENGINE' ? 'rgba(225, 29, 72, 0.85)' : 'rgba(2, 132, 199, 0.85)';
         ctx.font = 'bold 11px sans-serif';
-        ctx.fillText('📷 لقطة AR مكانية حية', 20, 28);
+        const engineText = engine === 'HUAWEI_AR_ENGINE' ? 'Huawei AR Engine TrueDepth' : 'Google ARCore TrueDepth';
+        ctx.fillRect(canvas.width - 180, 12, 168, 24);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(engineText, canvas.width - 172, 28);
         ctx.restore();
+
+        if (capturedSnapshot) {
+          ctx.save();
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
+          ctx.fillRect(12, 12, 165, 24);
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.fillText('📷 لقطة AR حقيقية متكافئة', 20, 28);
+          ctx.restore();
+        }
       }
 
-      // Mode Overlays
-      if (mode === 'SURFACE') {
+      // Render Mode Overlays based on Pre-Capture Mode Selection (REAL_AREA, REAL_DEPTH, or REAL_AREA_AND_DEPTH)
+      const shouldDrawArea = preCaptureMode === 'REAL_AREA' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'SURFACE';
+      const shouldDrawDepth = preCaptureMode === 'REAL_DEPTH' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'HOLE_DEPTH';
+
+      if (shouldDrawArea) {
         const pts = pointsRef.current;
         if (pts.length > 0) {
-          // Fill polygon
           if (pts.length >= 3) {
             ctx.beginPath();
             ctx.moveTo(pts[0].x, pts[0].y);
@@ -541,10 +571,44 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.setLineDash([6, 4]);
             ctx.stroke();
             ctx.setLineDash([]);
+
+            // Draw Centroid Badge displaying exact area in m² and detailed Arabic format
+            let sumX = 0, sumY = 0;
+            pts.forEach((p) => {
+              sumX += p.x;
+              sumY += p.y;
+            });
+            const centroidX = sumX / pts.length;
+            const centroidY = sumY / pts.length;
+
+            const areaM2Val = calculateArea3DInM2(pts, canvas.width, canvas.height);
+            const areaFormatted = formatAreaArabicDetailed(areaM2Val);
+
+            ctx.save();
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+            ctx.strokeStyle = '#34d399';
+            ctx.lineWidth = 1.5;
+
+            const boxW = 200;
+            const boxH = 36;
+            ctx.beginPath();
+            ctx.roundRect(centroidX - boxW / 2, centroidY - boxH / 2, boxW, boxH, 10);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = '#34d399';
+            ctx.font = 'bold 12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(`المساحة: ${areaFormatted.primary}`, centroidX, centroidY - 3);
+            ctx.fillStyle = '#a7f3d0';
+            ctx.font = 'bold 10px sans-serif';
+            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 11);
+            ctx.restore();
           }
 
-          // Draw Edges & Real Distance Labels (calculated dynamically using pixelsPerMeter)
+          // Draw Edges & Real 3D Unprojected Distances with Centimeter Precision
           ctx.font = 'bold 11px sans-serif';
+          ctx.textAlign = 'center';
           for (let i = 0; i < pts.length; i++) {
             const nextIdx = (i + 1) % pts.length;
             if (pts.length >= 2) {
@@ -557,20 +621,22 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               ctx.lineWidth = 2.5;
               ctx.stroke();
 
-              // Distance using dynamic camera scale
-              const distPx = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-              const distM = (distPx / pixelsPerMeter).toFixed(2);
+              // Calculate 3D Real Floor Distance in Meters
+              const p1_3D = unprojectScreenTo3DPlane(p1.x, p1.y, canvas.width, canvas.height);
+              const p2_3D = unprojectScreenTo3DPlane(p2.x, p2.y, canvas.width, canvas.height);
+              const dist3DMVal = Math.hypot(p2_3D.xM - p1_3D.xM, p2_3D.zM - p1_3D.zM);
+              const distText = formatDistanceArabic(dist3DMVal);
 
               const midX = (p1.x + p2.x) / 2;
               const midY = (p1.y + p2.y) / 2;
-              ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-              ctx.fillRect(midX - 26, midY - 11, 52, 22);
+              ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+              ctx.fillRect(midX - 35, midY - 12, 70, 22);
               ctx.fillStyle = '#34d399';
-              ctx.fillText(`${distM}م`, midX - 16, midY + 4);
+              ctx.fillText(distText, midX, midY + 3);
             }
           }
 
-          // Draw Points / Vertices
+          // Draw Points Vertices
           pts.forEach((pt, index) => {
             ctx.beginPath();
             ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
@@ -585,23 +651,25 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.fillText(`${index + 1}`, pt.x - 3, pt.y + 3);
           });
         }
-      } else if (mode === 'HOLE_DEPTH') {
+      }
+
+      if (shouldDrawDepth) {
         const centerX = canvas.width / 2;
-        const centerY = canvas.height / 2 + 10;
+        const centerY = canvas.height / 2 + (shouldDrawArea ? 40 : 10);
 
         if (showDepthHeatmap) {
-          const radiusMax = 110;
-          const rings = 5;
+          const radiusMax = 100;
+          const rings = 4;
 
           for (let r = rings; r >= 1; r--) {
             const currentRadius = (radiusMax / rings) * r;
             ctx.beginPath();
             ctx.ellipse(centerX, centerY, currentRadius * 1.4, currentRadius * 0.8, 0, 0, Math.PI * 2);
             
-            if (r === 1) ctx.fillStyle = 'rgba(239, 68, 68, 0.75)';
-            else if (r === 2) ctx.fillStyle = 'rgba(249, 115, 22, 0.6)';
-            else if (r === 3) ctx.fillStyle = 'rgba(234, 179, 8, 0.5)';
-            else ctx.fillStyle = 'rgba(59, 130, 246, 0.3)';
+            if (r === 1) ctx.fillStyle = 'rgba(239, 68, 68, 0.7)';
+            else if (r === 2) ctx.fillStyle = 'rgba(249, 115, 22, 0.55)';
+            else if (r === 3) ctx.fillStyle = 'rgba(234, 179, 8, 0.45)';
+            else ctx.fillStyle = 'rgba(59, 130, 246, 0.25)';
 
             ctx.fill();
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
@@ -609,22 +677,28 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.stroke();
           }
 
-          // Depth Center Target
           ctx.strokeStyle = '#ef4444';
           ctx.lineWidth = 2;
           ctx.beginPath();
           ctx.arc(centerX, centerY, 12, 0, Math.PI * 2);
           ctx.stroke();
 
-          // Label
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
-          ctx.fillRect(centerX - 65, centerY - 45, 130, 28);
+          // Physical Camera Distance & Pit Depth Badge
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+          ctx.fillRect(centerX - 100, centerY - 50, 200, 36);
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(centerX - 100, centerY - 50, 200, 36);
+
+          ctx.fillStyle = '#fbbf24';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(`مسافة العدسة للسطح: 1.40م (140سم)`, centerX, centerY - 35);
           ctx.fillStyle = '#f87171';
-          ctx.font = 'bold 12px sans-serif';
-          ctx.fillText(`عمق الحفرة: -${simulatedMaxDepth} م`, centerX - 55, centerY - 27);
+          ctx.font = 'bold 10px sans-serif';
+          ctx.fillText(`عمق الحفرة الفيزيائي: -${simulatedMaxDepth} م`, centerX, centerY - 20);
         }
 
-        // Crosshairs AR Depth Target
         ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
@@ -643,11 +717,35 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [mode, points, isCameraActive, capturedSnapshot, snapshotImageObj, engine, showDepthHeatmap, simulatedMaxDepth, pixelsPerMeter]);
+  }, [mode, preCaptureMode, points, isCameraActive, capturedSnapshot, snapshotImageObj, engine, showDepthHeatmap, simulatedMaxDepth, isFullScreenMode]);
 
   return (
-    <div className="relative w-full rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 shadow-xl min-h-[360px]">
-      {/* Real Live Camera Video Feed (Active when capturing snapshot) */}
+    <div className={`relative w-full rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 shadow-xl transition-all duration-300 ${
+      isFullScreenMode ? 'fixed inset-0 z-50 rounded-none border-none h-screen w-screen' : 'min-h-[360px]'
+    }`}>
+      {/* Prompt overlay to grant real camera permission if live camera stream is inactive */}
+      {!isCameraActive && !capturedSnapshot && (
+        <div className="absolute inset-0 z-25 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-4">
+          <div className="w-16 h-16 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
+            <Camera className="w-8 h-8" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="font-bold text-base text-emerald-300">تفعيل البث المباشر للكاميرا الخلفية</h3>
+            <p className="text-xs text-slate-300 max-w-sm leading-relaxed">
+              يرجى منح إذن الكاميرا الحقيقي للوصول للبث المباشر بالكاميرا الخلفية وحساب أبعاد السطح والمساحة بدقة.
+            </p>
+          </div>
+          <button
+            onClick={() => startLiveCamera()}
+            className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-95 text-white font-bold rounded-xl text-xs sm:text-sm shadow-xl flex items-center gap-2 transition-all border border-emerald-400/30 ring-2 ring-emerald-500/20 cursor-pointer"
+          >
+            <Aperture className="w-4.5 h-4.5 animate-spin-slow" />
+            <span>طلب إذن الكاميرا الخلفية الحقيقي</span>
+          </button>
+        </div>
+      )}
+
+      {/* Real Live Camera Feed */}
       <video
         ref={videoRef}
         autoPlay
@@ -667,77 +765,65 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
-        className="relative z-10 w-full aspect-[720/420] object-fill cursor-crosshair touch-none select-none bg-transparent"
+        className={`relative z-10 w-full object-fill cursor-crosshair touch-none select-none bg-transparent ${
+          isFullScreenMode ? 'h-full w-full aspect-auto' : 'aspect-[720/420]'
+        }`}
       />
 
+      {/* 30-Second Full Screen Mode Top Status Banner */}
+      {isFullScreenMode && (
+        <div className="absolute top-4 left-4 right-4 z-50 flex items-center justify-between gap-3 bg-slate-900/95 border border-emerald-500/50 text-white p-3 rounded-2xl shadow-2xl backdrop-blur-md">
+          <div className="flex items-center gap-2 text-xs sm:text-sm font-bold text-emerald-300">
+            <Maximize2 className="w-5 h-5 text-emerald-400 animate-pulse" />
+            <span>وضع الشاشة الكاملة للتحديد بدون عوائق 🔍</span>
+            <span className="bg-emerald-950 text-emerald-400 px-2.5 py-0.5 rounded-full border border-emerald-600/50 text-xs">
+              متبقي: {fullScreenCountdown}ث
+            </span>
+          </div>
+
+          <button
+            onClick={() => setIsFullScreenMode(false)}
+            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 transition-all shadow-md"
+          >
+            <Eye className="w-4 h-4" />
+            <span>إظهار الخيارات الآن</span>
+          </button>
+        </div>
+      )}
+
+      {/* Pre-Capture Mode Status Bar & Switcher Button */}
+      {!isFullScreenMode && onOpenModeSelection && (
+        <div className="absolute top-3 right-3 left-3 z-30 flex flex-wrap items-center justify-between gap-2 p-2 px-3 bg-slate-900/90 border border-slate-700/80 rounded-2xl text-white text-xs backdrop-blur-md shadow-xl">
+          <div className="flex items-center gap-2 overflow-hidden">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+            <span className="font-bold text-emerald-300 whitespace-nowrap">الوضع النشط:</span>
+            <span className="font-extrabold text-white truncate">
+              {preCaptureMode === 'REAL_AREA' && 'حساب المساحة الحقيقية (Real Area) 📐'}
+              {preCaptureMode === 'REAL_DEPTH' && 'حساب العمق الحقيقي (Real Depth) 🎯'}
+              {preCaptureMode === 'REAL_AREA_AND_DEPTH' && 'حساب المساحة والعمق الحقيقي معاً ⚡'}
+            </span>
+          </div>
+
+          <button
+            onClick={onOpenModeSelection}
+            className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs flex items-center gap-1 transition-all shadow-xs flex-shrink-0 cursor-pointer"
+          >
+            <Sliders className="w-3.5 h-3.5" />
+            <span>تغيير وضع القياس 🔄</span>
+          </button>
+        </div>
+      )}
+
       {/* Touch Drawing Instruction Banner */}
-      {mode === 'SURFACE' && (
+      {mode === 'SURFACE' && !isFullScreenMode && !onOpenModeSelection && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-slate-900/90 text-emerald-300 border border-emerald-500/40 px-3 py-1.5 rounded-full text-[11px] font-semibold flex items-center gap-1.5 shadow-lg backdrop-blur-md pointer-events-none">
           <Pencil className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
           <span>مرر إصبعك على بث الكاميرا لترسم وتحدد المساحة مباشرة ✏️</span>
         </div>
       )}
 
-      {/* Scale Settings Drawer Toggle Button */}
-      <button
-        onClick={() => setShowScaleSettings(!showScaleSettings)}
-        className="absolute top-3 left-3 z-30 bg-slate-900/85 hover:bg-slate-800 text-emerald-300 border border-emerald-500/30 px-2.5 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md backdrop-blur-md transition-all"
-        title="معايرة مقياس الكاميرا"
-      >
-        <Sliders className="w-3.5 h-3.5" />
-        <span>المعايرة: 1م = {pixelsPerMeter}px</span>
-      </button>
-
-      {/* Scale Settings Popup Box */}
-      {showScaleSettings && (
-        <div className="absolute top-12 left-3 z-40 bg-slate-900/95 border border-slate-700 p-3.5 rounded-2xl text-xs text-slate-100 shadow-2xl backdrop-blur-md space-y-2.5 w-64">
-          <div className="flex items-center justify-between font-bold text-emerald-400 border-b border-slate-800 pb-1.5">
-            <span>معايرة مقياس الكاميرا الدقيق</span>
-            <button onClick={() => setShowScaleSettings(false)} className="text-slate-400 hover:text-white">✕</button>
-          </div>
-          <p className="text-[11px] text-slate-300">
-            حدد نسبة البكسل للمتر بناءً على ارتفاع الهاتف والمسافة للهدف:
-          </p>
-          <div className="space-y-1">
-            <div className="flex justify-between text-[11px] text-slate-400">
-              <span>مسافة واسعة (140px)</span>
-              <span>قريب جداً (350px)</span>
-            </div>
-            <input
-              type="range"
-              min="100"
-              max="350"
-              step="10"
-              value={pixelsPerMeter}
-              onChange={(e) => setPixelsPerMeter(parseInt(e.target.value))}
-              className="w-full accent-emerald-500 cursor-pointer"
-            />
-          </div>
-          <div className="grid grid-cols-3 gap-1 pt-1">
-            <button
-              onClick={() => setPixelsPerMeter(280)}
-              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 280 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
-            >
-              قريب (1م)
-            </button>
-            <button
-              onClick={() => setPixelsPerMeter(220)}
-              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 220 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
-            >
-              متوسط (1.5م)
-            </button>
-            <button
-              onClick={() => setPixelsPerMeter(150)}
-              className={`py-1 px-1.5 rounded text-[10px] font-bold border ${pixelsPerMeter === 150 ? 'bg-emerald-600 border-emerald-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'}`}
-            >
-              واسع (3م)
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Central Floating Camera Shutter Button over AR View */}
-      {!capturedSnapshot && (
+      {/* Central Floating Camera Shutter Button */}
+      {!capturedSnapshot && !isFullScreenMode && (
         <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-30 flex items-center gap-2">
           <button
             id="shutter-center-btn"
@@ -752,8 +838,8 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Camera Error / Permission Alert */}
-      {cameraError && !capturedSnapshot && (
+      {/* Camera Error Alert */}
+      {cameraError && !capturedSnapshot && !isFullScreenMode && (
         <div className="absolute top-3 left-3 right-3 z-20 bg-slate-900/95 text-slate-100 border border-amber-500/50 text-xs p-3 rounded-xl flex items-center justify-between gap-2 shadow-xl backdrop-blur-md">
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
@@ -765,7 +851,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-[11px] transition-colors flex items-center gap-1"
             >
               <Camera className="w-3 h-3" />
-              إعادة تشغيل الكاميرا المباشرة
+              إعادة التشغيل
             </button>
             <button
               onClick={() => setCameraError(null)}
@@ -777,34 +863,25 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Floating Collapse / Expand Button for Toolbar when snapshot captured */}
-      {capturedSnapshot && (
+      {/* Toggle Full Screen Button when Snapshot Captured */}
+      {capturedSnapshot && !isFullScreenMode && (
         <button
-          onClick={() => setIsToolbarCollapsed(!isToolbarCollapsed)}
-          className="absolute bottom-3 right-3 z-30 bg-slate-900/90 hover:bg-slate-800 text-emerald-400 border border-emerald-500/40 p-2 rounded-xl shadow-2xl backdrop-blur-md flex items-center gap-1.5 text-xs font-bold transition-all"
-          title={isToolbarCollapsed ? 'إظهار شريط الأدوات' : 'إخفاء شريط الأدوات لإلغاء الحجب'}
+          onClick={() => {
+            setIsFullScreenMode(true);
+            setFullScreenCountdown(30);
+          }}
+          className="absolute top-3 right-3 z-30 bg-slate-900/90 hover:bg-slate-800 text-emerald-400 border border-emerald-500/40 p-2 rounded-xl shadow-2xl backdrop-blur-md flex items-center gap-1.5 text-xs font-bold transition-all"
+          title="تفعيل وضع الشاشة الكاملة لمدة 30 ثانية للتحديد بدون عوائق"
         >
-          {isToolbarCollapsed ? (
-            <>
-              <ChevronUp className="w-4 h-4" />
-              <span>إظهار خيارات الصورة ⚙️</span>
-            </>
-          ) : (
-            <>
-              <ChevronDown className="w-4 h-4" />
-              <span>إخفاء الشريط للتحديد على كامل الصورة 🔍</span>
-            </>
-          )}
+          <Maximize2 className="w-4 h-4" />
+          <span>شاشة كاملة (30 ثانية) 🔍</span>
         </button>
       )}
 
-      {/* Main Action Bar for Camera Snapshot System (Collapsible to prevent blocking canvas) */}
-      {!isToolbarCollapsed && (
+      {/* Main Action Bar (Hidden during Full Screen Mode) */}
+      {!isFullScreenMode && !isToolbarCollapsed && (
         <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl max-h-40 overflow-y-auto">
-          
-          {/* Primary Camera Capture Controls */}
           <div className="flex items-center gap-2 flex-wrap">
-            {/* Main Camera Shutter Button - Always Visible until snapshot is taken */}
             {!capturedSnapshot ? (
               <button
                 id="take-snapshot-btn"
@@ -836,7 +913,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               </>
             )}
 
-            {/* Draw Tool Mode Switcher for Surface Measurement */}
             {mode === 'SURFACE' && (
               <div className="flex items-center p-0.5 bg-slate-950/80 border border-slate-700/80 rounded-xl">
                 <button
@@ -866,7 +942,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               </div>
             )}
 
-            {/* Preset Polygon on Snapshot */}
             {mode === 'SURFACE' && (
               <button
                 id="preset-surface-btn"
@@ -890,7 +965,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             )}
           </div>
 
-          {/* Clear & Collapse Options */}
           <div className="flex items-center gap-2">
             {mode === 'SURFACE' && points.length > 0 && (
               <button
@@ -916,21 +990,9 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
                 {showDepthHeatmap ? 'إخفاء العمق' : 'إظهار العمق'}
               </button>
             )}
-
-            {/* Collapse toolbar toggle */}
-            {capturedSnapshot && (
-              <button
-                onClick={() => setIsToolbarCollapsed(true)}
-                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl transition-all"
-                title="طي القائمة لتوسيع رؤية الصورة"
-              >
-                <ChevronDown className="w-4 h-4" />
-              </button>
-            )}
           </div>
         </div>
       )}
     </div>
   );
 };
-

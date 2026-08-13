@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { AREngineType } from '../types';
+import { AREngineType, PreCaptureMeasurementMode } from '../types';
 import { ARCameraView } from './ARCameraView';
+import { PreCaptureSelectionModal } from './PreCaptureSelectionModal';
 import { ARABIC_STRINGS } from '../constants/arabicStrings';
 import { 
   Layers, 
@@ -10,7 +11,9 @@ import {
   AlertTriangle, 
   Sparkles, 
   BarChart2, 
-  Package 
+  Package,
+  Sliders,
+  Ruler
 } from 'lucide-react';
 
 interface ARDepthHoleCalculatorProps {
@@ -23,6 +26,10 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
   const [holeLengthM, setHoleLengthM] = useState<number>(3.0);
   const [maxDepthM, setMaxDepthM] = useState<number>(0.45);
   const [avgDepthM, setAvgDepthM] = useState<number>(0.30);
+
+  // Pre-Capture Measurement Mode State
+  const [preCaptureMode, setPreCaptureMode] = useState<PreCaptureMeasurementMode>('REAL_DEPTH');
+  const [isSelectionModalOpen, setIsSelectionModalOpen] = useState<boolean>(false);
 
   // Surface Area = Width x Length
   const calculatedAreaM2 = Math.round((holeWidthM * holeLengthM) * 100) / 100;
@@ -43,9 +50,20 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
 
   return (
     <div className="space-y-6">
+      {/* Pre-Capture Measurement Mode Selection Modal */}
+      <PreCaptureSelectionModal
+        isOpen={isSelectionModalOpen}
+        selectedMode={preCaptureMode}
+        onSelectMode={(mode) => {
+          setPreCaptureMode(mode);
+          setIsSelectionModalOpen(false);
+        }}
+        onClose={() => setIsSelectionModalOpen(false)}
+      />
+
       {/* Header Banner */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs">
-        <div className="flex items-start justify-between gap-4">
+      <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div>
             <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
               <Layers className="w-6 h-6 text-amber-600" />
@@ -56,9 +74,33 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
             </p>
           </div>
 
-          <div className="hidden sm:block text-xs px-3 py-1.5 rounded-xl bg-amber-50 text-amber-800 border border-amber-200 font-semibold">
-            Feature B Active (AR Depth API)
+          <button
+            onClick={() => setIsSelectionModalOpen(true)}
+            className="px-4 py-2.5 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white font-bold rounded-xl text-xs sm:text-sm flex items-center gap-2 transition-all shadow-md active:scale-95 cursor-pointer whitespace-nowrap"
+          >
+            <Sliders className="w-4 h-4 text-amber-200" />
+            <span>شاشة اختيار وضع القياس قبل الكاميرا 🎯</span>
+          </button>
+        </div>
+
+        {/* Selected Mode Quick Tag */}
+        <div className="bg-amber-50/80 border border-amber-200 p-2.5 rounded-xl flex items-center justify-between text-xs text-amber-900 font-semibold">
+          <div className="flex items-center gap-2">
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-600 animate-ping" />
+            <span>وضع القياس قبل التصوير المختار:</span>
+            <span className="font-extrabold text-amber-950">
+              {preCaptureMode === 'REAL_AREA' && 'حساب المساحة الحقيقية (Real Area)'}
+              {preCaptureMode === 'REAL_DEPTH' && 'حساب العمق الحقيقي (Real Depth)'}
+              {preCaptureMode === 'REAL_AREA_AND_DEPTH' && 'حساب المساحة والعمق الحقيقي معاً'}
+            </span>
           </div>
+
+          <button
+            onClick={() => setIsSelectionModalOpen(true)}
+            className="text-[11px] text-amber-800 underline font-bold hover:text-amber-950"
+          >
+            تغيير الوضع
+          </button>
         </div>
       </div>
 
@@ -69,6 +111,8 @@ export const ARDepthHoleCalculator: React.FC<ARDepthHoleCalculatorProps> = ({ en
         <div className="lg:col-span-7 space-y-4">
           <ARCameraView
             mode="HOLE_DEPTH"
+            preCaptureMode={preCaptureMode}
+            onOpenModeSelection={() => setIsSelectionModalOpen(true)}
             points={points}
             setPoints={setPoints}
             engine={engine}

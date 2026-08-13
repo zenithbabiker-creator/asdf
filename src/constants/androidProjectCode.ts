@@ -17,13 +17,15 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        // Local directory repositories for Huawei AR Engine AAR SDK (arenginesdk-4.0.0.5.aar)
+        // Local directory repositories for Huawei AR Engine AAR SDK (ar engine sdk 4.0.0.5.aar)
         flatDir {
             dirs(
+                file("\${rootDir}/assets"),
+                file("\${rootDir}/assets/libs"),
+                file("\${rootDir}/app/src/main/assets"),
                 file("\${rootDir}/huawei-ar-sdk"),
                 file("\${rootDir}/libs"),
-                file("\${rootDir}/app/libs"),
-                file("\${rootDir}/app/src/main/assets")
+                file("\${rootDir}/app/libs")
             )
         }
     }
@@ -79,9 +81,12 @@ android {
 repositories {
     google()
     mavenCentral()
-    // Local Huawei SDK lookup (arenginesdk-4.0.0.5.aar placed manually in assets/ / libs/ / huawei-ar-sdk/)
+    // Local Huawei SDK lookup (ar engine sdk 4.0.0.5.aar placed in assets/ or libs/)
     flatDir {
         dirs(
+            file("\${rootDir}/assets"),
+            file("\${rootDir}/assets/libs"),
+            file("\${rootDir}/app/src/main/assets"),
             file("\${rootDir}/huawei-ar-sdk"),
             file("\${rootDir}/libs"),
             file("libs"),
@@ -105,12 +110,14 @@ dependencies {
     // Google ARCore SDK
     implementation("com.google.ar:core:1.47.0")
 
-    // Local Huawei AR Engine SDK (arenginesdk-4.0.0.5.aar placed manually in assets/, libs/, or huawei-ar-sdk/)
-    // NO remote maven fetching used for Huawei AAR - loaded directly from local directories:
+    // Local Huawei AR Engine SDK (ar engine sdk 4.0.0.5.aar / arenginesdk-4.0.0.5.aar in assets/ or libs/)
+    // Local offline resolution - NO remote maven fetching:
+    implementation(fileTree(mapOf("dir" to "\${rootDir}/assets", "include" to listOf("*.aar", "*.jar"))))
+    implementation(fileTree(mapOf("dir" to "\${rootDir}/assets/libs", "include" to listOf("*.aar", "*.jar"))))
+    implementation(fileTree(mapOf("dir" to "src/main/assets", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "\${rootDir}/huawei-ar-sdk", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "\${rootDir}/libs", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar", "*.jar"))))
-    implementation(fileTree(mapOf("dir" to "src/main/assets", "include" to listOf("*.aar", "*.jar"))))
 }
 `,
   },
@@ -137,13 +144,15 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // Flat dir repository for local Huawei AR Engine AAR (arenginesdk-4.0.0.5.aar)
+        // Flat dir repository for local Huawei AR Engine AAR (ar engine sdk 4.0.0.5.aar)
         flatDir {
             dirs(
+                file("./assets"),
+                file("./assets/libs"),
+                file("./app/src/main/assets"),
                 file("./huawei-ar-sdk"),
                 file("./libs"),
-                file("./app/libs"),
-                file("./app/src/main/assets")
+                file("./app/libs")
             )
         }
     }
@@ -214,7 +223,7 @@ include(":app")
     content: `<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">زون لتصاميم الحدائق</string>
-    <string name="app_subtitle">Zone Garden Designs &amp; AR Soil Calculator</string>
+    <string name="app_subtitle">Zone Garden Designs &amp; AR Turf Calculator</string>
     
     <!-- Engine Detection -->
     <string name="engine_huawei">محرك Huawei AR Engine النشط (المكتبة المحلية ./huawei-ar-sdk/)</string>
@@ -222,46 +231,32 @@ include(":app")
     <string name="huawei_detected">تم الكشف عن نظام هواتف هواوي/هونر دون خدمات جوجل - توجيه تلقائي لـ Huawei AR Engine</string>
 
     <!-- Navigation -->
-    <string name="tab_surface_calculator">قياس المسطحات والتربة</string>
+    <string name="tab_surface_calculator">محددات النباتات وحساب شتول النجيلة</string>
     <string name="tab_depth_hole_calculator">قياس الحفر وحجم الردم</string>
     
     <!-- Feature A -->
-    <string name="surface_title">قياس مساحة السطح وحساب كمية التربة</string>
-    <string name="select_depth">اختر عمق التربة المطلوب (متر):</string>
-    <string name="select_soil_type">نوع التربة الزراعية:</string>
-    <string name="surface_area_fmt">المساحة السطحية: %.2f م²</string>
-    <string name="soil_volume_fmt">حجم التربة المطلوبة: %.3f م³</string>
-    <string name="soil_weight_fmt">الوزن التقديري للتربة: %.1f كجم (%.2f طن)</string>
-    <string name="bags_50l_fmt">أكياس 50L المطلوبة: %d كيس</string>
-    <string name="bags_25l_fmt">أكياس 25L المطلوبة: %d كيس</string>
-    <string name="cost_fmt">التكلفة التقديرية: %.0f ر.س</string>
+    <string name="surface_title">محددات النباتات وحساب العدد الكلي لشتول النجيلة</string>
+    <string name="select_seedlings_per_m2">اختر عدد شتول النجيلة في المتر المربع:</string>
+    <string name="surface_area_fmt">المساحة الكلية للحديقة: %.2f م²</string>
+    <string name="reserved_area_fmt">المساحة المحجوزة للمحددات: %.2f م²</string>
+    <string name="remaining_turf_fmt">المساحة المتبقية للنجيلة: %.2f م²</string>
+    <string name="seedlings_count_fmt">العدد الكلي لشتول النجيلة: %d شتلة</string>
 
-    <!-- Feature B -->
-    <string name="depth_hole_title">قياس عمق الحفر والخنادق وحساب الردم (Backfill)</string>
-    <string name="max_depth_fmt">أقصى عمق للحفرة: %.2f م</string>
-    <string name="avg_depth_fmt">متوسط العمق: %.2f م</string>
-    <string name="backfill_volume_fmt">حجم الردم المطلوب: %.3f م³</string>
+    <!-- Pre-Capture Measurement Mode Selection -->
+    <string name="pre_capture_selection_title">شاشة اختيار وضع القياس قبل الكاميرا</string>
+    <string name="mode_real_area">حساب المساحة الحقيقية (Real Area)</string>
+    <string name="mode_real_depth">حساب العمق الحقيقي (Real Depth)</string>
+    <string name="mode_real_area_and_depth">حساب المساحة والعمق الحقيقي معاً</string>
+    <string name="mode_real_area_desc">لقياس أبعاد السطح (الطول والعرض) والمساحة بالمتر المربع والسم²</string>
+    <string name="mode_real_depth_desc">لقياس المسافة بين الكاميرا والهدف وعمق الحفر بدقة</string>
+    <string name="mode_real_area_and_depth_desc">القياس الكامل المزدوج لأبعاد السطح والعمق والمسافة بنفس الوقت</string>
     
-    <!-- Dropdown Items Sequence (Strict 0.05m to 0.95m) -->
-    <string name="depth_0_05">0.05 م (5 سم)</string>
-    <string name="depth_0_10">0.10 م (10 سم)</string>
-    <string name="depth_0_15">0.15 م (15 سم)</string>
-    <string name="depth_0_20">0.20 م (20 سم)</string>
-    <string name="depth_0_25">0.25 م (25 سم)</string>
-    <string name="depth_0_30">0.30 م (30 سم)</string>
-    <string name="depth_0_35">0.35 م (35 سم)</string>
-    <string name="depth_0_40">0.40 م (40 سم)</string>
-    <string name="depth_0_45">0.45 م (45 سم)</string>
-    <string name="depth_0_50">0.50 م (50 سم)</string>
-    <string name="depth_0_55">0.55 م (55 سم)</string>
-    <string name="depth_0_60">0.60 م (60 سم)</string>
-    <string name="depth_0_65">0.65 م (65 سم)</string>
-    <string name="depth_0_70">0.70 م (70 سم)</string>
-    <string name="depth_0_75">0.75 م (75 سم)</string>
-    <string name="depth_0_80">0.80 م (80 سم)</string>
-    <string name="depth_0_85">0.85 م (85 سم)</string>
-    <string name="depth_0_90">0.90 م (90 سم)</string>
-    <string name="depth_0_95">0.95 م (95 سم)</string>
+    <!-- Dropdown Items Sequence (Strict 10 to 30 seedlings/m²) -->
+    <string name="seedling_10">10 شتلات في المتر المربع (10 شتلة/م²)</string>
+    <string name="seedling_15">15 شتلة في المتر المربع (15 شتلة/م²)</string>
+    <string name="seedling_20">20 شتلة في المتر المربع (20 شتلة/م²)</string>
+    <string name="seedling_25">25 شتلة في المتر المربع (25 شتلة/م²)</string>
+    <string name="seedling_30">30 شتلة في المتر المربع (30 شتلة/م²)</string>
 </resources>
 `,
   },
