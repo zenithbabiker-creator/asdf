@@ -13,6 +13,32 @@ export interface Point3D {
   z: number;
 }
 
+export interface SpatialAnchor3D {
+  id: string;
+  worldPosition: Point3D;
+  planeNormal?: Point3D;
+  screenPoint: Point2D;
+  timestamp: number;
+  attachedTrackableId?: string;
+}
+
+export interface ARFrameSpatialContext {
+  cameraPose: {
+    position: Point3D;
+    orientation: [number, number, number, number];
+  };
+  intrinsics: {
+    focalLengthPx: number;
+    principalPoint: Point2D;
+    fovDegrees: number;
+  };
+  cameraHeightM: number;
+  cameraPitchRad: number;
+  depthMapAvailable: boolean;
+  depthMode: 'AUTOMATIC' | 'DISABLED';
+  timestamp: number;
+}
+
 export type PlantSelectorType = 'large' | 'medium' | 'small';
 
 export interface PlantSelectorItem {

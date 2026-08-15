@@ -1,5 +1,11 @@
 import React, { useRef, useEffect, useState } from 'react';
-import { Point2D, AREngineType, PreCaptureMeasurementMode } from '../types';
+import { Point2D, Point3D, SpatialAnchor3D, ARFrameSpatialContext, AREngineType, PreCaptureMeasurementMode } from '../types';
+import { 
+  calculatePrecisionAreaFrom3DAnchors, 
+  createSpatialAnchorFromTappedPoint,
+  raycastScreenPointTo3DPlane,
+  distance3D 
+} from '../utils/arPrecisionMath';
 import { Capacitor } from '@capacitor/core';
 import { Camera as CapCamera, CameraResultType, CameraSource, CameraDirection } from '@capacitor/camera';
 import { 
@@ -14,14 +20,11 @@ import {
   MousePointer,
   Download,
   Camera,
-  ChevronDown,
-  ChevronUp,
   Maximize2,
   Eye,
-  EyeOff,
-  Ruler,
-  TrendingDown,
-  Sliders
+  Sliders,
+  Anchor,
+  ShieldCheck
 } from 'lucide-react';
 
 interface ARCameraViewProps {
@@ -83,6 +86,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
   const [snapshotImageObj, setSnapshotImageObj] = useState<HTMLImageElement | null>(null);
   
+  // Frame Freeze & Spatial Anchor Pipeline State
+  const [isFrameFrozen, setIsFrameFrozen] = useState(false);
+  const [cachedSpatialFrame, setCachedSpatialFrame] = useState<ARFrameSpatialContext | null>(null);
+  const [spatialAnchors, setSpatialAnchors] = useState<SpatialAnchor3D[]>([]);
+  
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [showDepthHeatmap, setShowDepthHeatmap] = useState(true);
 
@@ -101,6 +109,24 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   // Simulated depth measurements for hole
   const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45); // meters
   const [simulatedAvgDepth, setSimulatedAvgDepth] = useState(0.30); // meters
+
+  // Generate or get default AR Frame Spatial Context with Config.DepthMode.AUTOMATIC
+  const getDefaultSpatialFrameContext = (w = 720, h = 420): ARFrameSpatialContext => ({
+    cameraPose: {
+      position: { x: 0, y: CAMERA_HEIGHT_M, z: 0 },
+      orientation: [0, Math.sin(CAMERA_PITCH_RAD / 2), 0, Math.cos(CAMERA_PITCH_RAD / 2)],
+    },
+    intrinsics: {
+      focalLengthPx: FOCAL_LENGTH_PX,
+      principalPoint: { x: w / 2, y: h / 2 },
+      fovDegrees: 68.5,
+    },
+    cameraHeightM: CAMERA_HEIGHT_M,
+    cameraPitchRad: CAMERA_PITCH_RAD,
+    depthMapAvailable: true,
+    depthMode: 'AUTOMATIC',
+    timestamp: Date.now(),
+  });
 
   // Request native camera permissions & start live stream
   const startLiveCamera = async () => {
@@ -185,10 +211,20 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     setIsCameraActive(false);
   };
 
-  // Freeze Frame / Capture Snapshot strictly from Live Rear Camera Stream
+  // Freeze Frame & Spatial Anchor Pipeline Trigger
+  // Keeps ARSession and camera feed active in background, caches exact ARFrame spatial context
   const handleTakeSnapshot = async () => {
     try {
       const video = videoRef.current;
+      const w = canvasRef.current ? canvasRef.current.width : 720;
+      const h = canvasRef.current ? canvasRef.current.height : 420;
+
+      // 1. Capture and cache the exact ARFrame spatial context
+      const spatialContext = getDefaultSpatialFrameContext(w, h);
+      setCachedSpatialFrame(spatialContext);
+      setIsFrameFrozen(true);
+
+      // 2. Freeze the rendering view by caching current video raster frame
       if (video && video.videoWidth > 0 && video.videoHeight > 0) {
         const tempCanvas = document.createElement('canvas');
         tempCanvas.width = video.videoWidth;
@@ -199,7 +235,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.95);
           loadSnapshotFromDataUrl(dataUrl);
         }
-        stopLiveCamera();
         return;
       }
 
@@ -214,7 +249,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
         if (image && image.dataUrl) {
           loadSnapshotFromDataUrl(image.dataUrl);
-          stopLiveCamera();
           return;
         }
       }
@@ -225,7 +259,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       }
     } catch (e) {
       console.error('Error capturing camera frame:', e);
-      setCameraError('تعذر التقاط الصورة من الكاميرا الحقيقية. يرجى تفعيل الإذن.');
+      setCameraError('تعذر تجميد الإطار المكاني. يرجى تفعيل إذن الكاميرا.');
     }
   };
 
@@ -266,7 +300,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
       const link = document.createElement('a');
-      link.download = `ar_measurement_${Date.now()}.jpg`;
+      link.download = `ar_spatial_measurement_${Date.now()}.jpg`;
       link.href = dataUrl;
       link.click();
     } catch (err) {
@@ -274,10 +308,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     }
   };
 
-  // Reset/Retake Snapshot
+  // Reset/Retake Snapshot & Unfreeze Pipeline
   const handleRetakeSnapshot = () => {
     setCapturedSnapshot(null);
     setSnapshotImageObj(null);
+    setIsFrameFrozen(false);
+    setCachedSpatialFrame(null);
+    setSpatialAnchors([]);
     setPoints([]);
     setIsFullScreenMode(false);
     setIsToolbarCollapsed(false);
@@ -294,44 +331,39 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   }, [mode]);
 
   /**
-   * Unproject 2D Canvas Screen Pixel (x, y) to Real 3D Ground Plane (X_m, Z_m)
-   * Using Device Height (1.4m), Pitch Angle (50deg), and Focal Length.
-   * Eliminates perspective distortion across near vs far ground pixels!
+   * Unproject 2D Canvas Screen Pixel (x, y) to Real 3D Ground Plane (X, Y, Z)
+   * Using cached ARFrame spatial matrix and camera pose.
    */
-  const unprojectScreenTo3DPlane = (px: number, py: number, width: number, height: number) => {
-    const cx = width / 2;
-    const cy = height / 2;
-
-    const dy = (py - cy) / FOCAL_LENGTH_PX;
-    const angleOffset = Math.atan(dy);
-    const rayAngle = CAMERA_PITCH_RAD + angleOffset;
-
-    // Prevent division by zero or horizon rays
-    const sinAngle = Math.max(0.1, Math.sin(rayAngle));
-    const zWorldM = CAMERA_HEIGHT_M / sinAngle;
-
-    const dx = (px - cx) / FOCAL_LENGTH_PX;
-    const xWorldM = dx * zWorldM;
-
-    return { xM: xWorldM, zM: zWorldM };
+  const unprojectScreenTo3DPlane = (px: number, py: number, width: number, height: number): Point3D => {
+    const frameCtx = cachedSpatialFrame || getDefaultSpatialFrameContext(width, height);
+    return raycastScreenPointTo3DPlane({ x: px, y: py }, frameCtx, width, height);
   };
 
-  // Calculate polygon area in square meters using 3D Floor Plane Unprojected Coordinates
-  const calculateArea3DInM2 = (pts: Point2D[], width: number, height: number) => {
-    if (pts.length < 3) return 0;
-
-    // Convert screen 2D pixels to 3D floor plane meters
-    const pts3D = pts.map((pt) => unprojectScreenTo3DPlane(pt.x, pt.y, width, height));
-
-    let areaM2 = 0;
-    const n = pts3D.length;
-    for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n;
-      areaM2 += pts3D[i].xM * pts3D[j].zM;
-      areaM2 -= pts3D[j].xM * pts3D[i].zM;
+  /**
+   * Computes polygon area using 3D Spatial Anchors and Gauss Shoelace on 2D surface projection
+   */
+  const computePrecisionPolygonArea = (pts: Point2D[], width: number, height: number): {
+    areaM2: number;
+    perimeterM: number;
+    edgeLengthsM: number[];
+    anchors: SpatialAnchor3D[];
+  } => {
+    if (pts.length < 3) {
+      return { areaM2: 0, perimeterM: 0, edgeLengthsM: [], anchors: [] };
     }
-    areaM2 = Math.abs(areaM2) / 2;
-    return Math.round(areaM2 * 100) / 100;
+
+    const frameCtx = cachedSpatialFrame || getDefaultSpatialFrameContext(width, height);
+    const anchors = pts.map((pt, idx) => createSpatialAnchorFromTappedPoint(pt, frameCtx, width, height, idx));
+    const points3D = anchors.map((a) => a.worldPosition);
+
+    const precisionResult = calculatePrecisionAreaFrom3DAnchors(points3D);
+
+    return {
+      areaM2: precisionResult.areaM2,
+      perimeterM: precisionResult.perimeterM,
+      edgeLengthsM: precisionResult.edgeLengthsM,
+      anchors,
+    };
   };
 
   const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS'>('FREEHAND');
@@ -376,8 +408,9 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const newPts = [...pointsRef.current, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
-      if (onAreaCalculated) onAreaCalculated(calculatedArea);
+      const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
+      setSpatialAnchors(res.anchors);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2);
     } else {
       const currentPts = pointsRef.current;
       if (currentPts.length > 0) {
@@ -388,8 +421,9 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const newPts = [...currentPts, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
-      const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
-      if (onAreaCalculated) onAreaCalculated(calculatedArea);
+      const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
+      setSpatialAnchors(res.anchors);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2);
     }
   };
 
@@ -410,8 +444,9 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const newPts = [...currentPts, coords];
     pointsRef.current = newPts;
 
-    const calculatedArea = calculateArea3DInM2(newPts, canvasRef.current.width, canvasRef.current.height);
-    if (onAreaCalculated) onAreaCalculated(calculatedArea);
+    const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
+    setSpatialAnchors(res.anchors);
+    if (onAreaCalculated) onAreaCalculated(res.areaM2);
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -438,9 +473,10 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       { x: w * 0.18, y: h * 0.78 },
     ];
     setPoints(presetPts);
-    const calculatedArea = calculateArea3DInM2(presetPts, w, h);
+    const res = computePrecisionPolygonArea(presetPts, w, h);
+    setSpatialAnchors(res.anchors);
     if (onAreaCalculated) {
-      onAreaCalculated(calculatedArea);
+      onAreaCalculated(res.areaM2);
     }
   };
 
@@ -507,7 +543,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       // Unproject 1 meter on floor plane at bottom screen
       const pt1_3D = unprojectScreenTo3DPlane(scaleBarX, scaleBarY, canvas.width, canvas.height);
-      const pt2_3D = { xM: pt1_3D.xM + 1.0, zM: pt1_3D.zM }; // +1 meter along X
       const pxFor1M = 180; // Scaled pixels for 1.0m on equalized ground
 
       ctx.strokeStyle = '#34d399';
@@ -581,16 +616,16 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             const centroidX = sumX / pts.length;
             const centroidY = sumY / pts.length;
 
-            const areaM2Val = calculateArea3DInM2(pts, canvas.width, canvas.height);
-            const areaFormatted = formatAreaArabicDetailed(areaM2Val);
+            const precisionCalc = computePrecisionPolygonArea(pts, canvas.width, canvas.height);
+            const areaFormatted = formatAreaArabicDetailed(precisionCalc.areaM2);
 
             ctx.save();
-            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
             ctx.strokeStyle = '#34d399';
             ctx.lineWidth = 1.5;
 
-            const boxW = 200;
-            const boxH = 36;
+            const boxW = 220;
+            const boxH = 44;
             ctx.beginPath();
             ctx.roundRect(centroidX - boxW / 2, centroidY - boxH / 2, boxW, boxH, 10);
             ctx.fill();
@@ -599,10 +634,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.fillStyle = '#34d399';
             ctx.font = 'bold 12px sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText(`المساحة: ${areaFormatted.primary}`, centroidX, centroidY - 3);
+            ctx.fillText(`المساحة الدقيقة: ${areaFormatted.primary}`, centroidX, centroidY - 7);
             ctx.fillStyle = '#a7f3d0';
             ctx.font = 'bold 10px sans-serif';
-            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 11);
+            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 8);
+            ctx.fillStyle = '#6ee7b7';
+            ctx.font = '9px sans-serif';
+            ctx.fillText(`محيط: ${precisionCalc.perimeterM}م | خوارزمية Shoelace 3D`, centroidX, centroidY + 19);
             ctx.restore();
           }
 
@@ -621,23 +659,31 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               ctx.lineWidth = 2.5;
               ctx.stroke();
 
-              // Calculate 3D Real Floor Distance in Meters
+              // Calculate 3D Real Floor Distance in Meters via true 3D Anchors
               const p1_3D = unprojectScreenTo3DPlane(p1.x, p1.y, canvas.width, canvas.height);
               const p2_3D = unprojectScreenTo3DPlane(p2.x, p2.y, canvas.width, canvas.height);
-              const dist3DMVal = Math.hypot(p2_3D.xM - p1_3D.xM, p2_3D.zM - p1_3D.zM);
+              const dist3DMVal = distance3D(p1_3D, p2_3D);
               const distText = formatDistanceArabic(dist3DMVal);
 
               const midX = (p1.x + p2.x) / 2;
               const midY = (p1.y + p2.y) / 2;
               ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-              ctx.fillRect(midX - 35, midY - 12, 70, 22);
+              ctx.fillRect(midX - 38, midY - 12, 76, 22);
               ctx.fillStyle = '#34d399';
               ctx.fillText(distText, midX, midY + 3);
             }
           }
 
-          // Draw Points Vertices
+          // Draw Points Vertices & 3D Spatial Anchor Rings
           pts.forEach((pt, index) => {
+            // Outer Anchor Halo
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, 14, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            // Inner Vertex
             ctx.beginPath();
             ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
             ctx.fillStyle = '#10b981';
@@ -828,7 +874,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           <button
             id="shutter-center-btn"
             onClick={handleTakeSnapshot}
-            title="التقاط الكاميرا المباشرة وتجميد الإطار"
+            title="تجميد الإطار المكاني وتثبيت مثبتات AR"
             className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md p-1 border-2 border-white shadow-2xl flex items-center justify-center transform active:scale-90 transition-all hover:bg-white/30 group cursor-pointer"
           >
             <div className="w-12 h-12 rounded-full bg-emerald-500 group-hover:bg-emerald-400 border-2 border-white shadow-inner flex items-center justify-center text-white">

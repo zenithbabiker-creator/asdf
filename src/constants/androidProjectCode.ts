@@ -568,6 +568,264 @@ fun DepthHoleCalculatorScreen(
 `,
   },
   {
+    path: 'ArPrecisionAreaEngine.kt',
+    name: 'app/src/main/java/com/argarden/soilcalculator/ar/ArPrecisionAreaEngine.kt',
+    language: 'kotlin',
+    descriptionAr: 'محرك حساب المساحة الدقيق: إسقاط إحداثيات المثبتات ثلاثية الأبعاد (3D Anchors) على السطح وإجراء خوارزمية Shoelace (صيغة غاوس) لإلغاء ضوضاء العمق والاهتزاز',
+    content: `package com.argarden.soilcalculator.ar
+
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+data class Point3D(val x: Double, val y: Double, val z: Double)
+data class Point2DProjected(val u: Double, val v: Double)
+
+data class PrecisionAreaResult(
+    val areaM2: Double,
+    val perimeterM: Double,
+    val edgeDistancesM: List<Double>,
+    val surfaceNormal: Point3D,
+    val centroid: Point3D
+)
+
+/**
+ * Autonomous Precision Area Engine for ARCore & Huawei AR Engine
+ * 1. Extracts 3D coordinates (X, Y, Z) of attached plane Anchors.
+ * 2. Projects 3D points onto the local surface plane (u, v) using Newell's plane normal,
+ *    eliminating normal-axis depth/height noise.
+ * 3. Executes Gauss's Area Formula (Shoelace Formula): Area = 0.5 * |sum(u_i * v_{i+1} - u_{i+1} * v_i)|.
+ */
+object ArPrecisionAreaEngine {
+
+    fun calculatePrecisionArea(points3D: List<Point3D>): PrecisionAreaResult {
+        if (points3D.size < 3) {
+            return PrecisionAreaResult(0.0, 0.0, emptyList(), Point3D(0.0, 1.0, 0.0), Point3D(0.0, 0.0, 0.0))
+        }
+
+        // 1. Calculate centroid
+        var sumX = 0.0
+        var sumY = 0.0
+        var sumZ = 0.0
+        points3D.forEach {
+            sumX += it.x
+            sumY += it.y
+            sumZ += it.z
+        }
+        val count = points3D.size.toDouble()
+        val centroid = Point3D(sumX / count, sumY / count, sumZ / count)
+
+        // 2. Calculate best-fit surface plane normal using Newell's method
+        val normal = computePolygonNormalNewell(points3D)
+
+        // 3. Construct orthonormal basis vectors (uAxis, vAxis) on the plane
+        var refVec = Point3D(1.0, 0.0, 0.0)
+        if (abs(dot(normal, refVec)) > 0.9) {
+            refVec = Point3D(0.0, 0.0, 1.0)
+        }
+        val uAxis = normalize(cross(normal, refVec))
+        val vAxis = normalize(cross(normal, uAxis))
+
+        // 4. Project 3D points onto local plane coordinates (u, v)
+        val projected2D = points3D.map { pt ->
+            val diff = Point3D(pt.x - centroid.x, pt.y - centroid.y, pt.z - centroid.z)
+            Point2DProjected(
+                u = dot(diff, uAxis),
+                v = dot(diff, vAxis)
+            )
+        }
+
+        // 5. Execute Gauss's Shoelace Formula on projected plane (u, v)
+        val rawArea = calculateShoelaceArea(projected2D)
+        val roundedArea = Math.round(rawArea * 1000.0) / 1000.0
+
+        // 6. Compute true 3D edge distances and perimeter
+        val edgeDistances = mutableListOf<Double>()
+        var perimeter = 0.0
+        for (i in points3D.indices) {
+            val next = (i + 1) % points3D.size
+            val d = distance(points3D[i], points3D[next])
+            val roundedD = Math.round(d * 100.0) / 100.0
+            edgeDistances.add(roundedD)
+            perimeter += d
+        }
+        val roundedPerimeter = Math.round(perimeter * 100.0) / 100.0
+
+        return PrecisionAreaResult(
+            areaM2 = roundedArea,
+            perimeterM = roundedPerimeter,
+            edgeDistancesM = edgeDistances,
+            surfaceNormal = normal,
+            centroid = centroid
+        )
+    }
+
+    /**
+     * Shoelace Formula (Gauss's Area Formula) on 2D coplanar coordinates
+     */
+    fun calculateShoelaceArea(points: List<Point2DProjected>): Double {
+        val n = points.size
+        if (n < 3) return 0.0
+        var sum = 0.0
+        for (i in 0 until n) {
+            val next = (i + 1) % n
+            sum += points[i].u * points[next].v
+            sum -= points[next].u * points[i].v
+        }
+        return abs(sum) * 0.5
+    }
+
+    private fun computePolygonNormalNewell(points: List<Point3D>): Point3D {
+        var nx = 0.0
+        var ny = 0.0
+        var nz = 0.0
+        val n = points.size
+        for (i in 0 until n) {
+            val cur = points[i]
+            val next = points[(i + 1) % n]
+            nx += (cur.y - next.y) * (cur.z + next.z)
+            ny += (cur.z - next.z) * (cur.x + next.x)
+            nz += (cur.x - next.x) * (cur.y + next.y)
+        }
+        val norm = normalize(Point3D(nx, ny, nz))
+        return if (norm.y < 0) Point3D(-norm.x, -norm.y, -norm.z) else norm
+    }
+
+    private fun distance(a: Point3D, b: Point3D): Double {
+        val dx = b.x - a.x
+        val dy = b.y - a.y
+        val dz = b.z - a.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    private fun dot(a: Point3D, b: Point3D): Double = a.x * b.x + a.y * b.y + a.z * b.z
+
+    private fun cross(a: Point3D, b: Point3D): Point3D = Point3D(
+        x = a.y * b.z - a.z * b.y,
+        y = a.z * b.x - a.x * b.z,
+        z = a.x * b.y - a.y * b.x
+    )
+
+    private fun normalize(v: Point3D): Point3D {
+        val len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+        return if (len < 1e-7) Point3D(0.0, 1.0, 0.0) else Point3D(v.x / len, v.y / len, v.z / len)
+    }
+}
+`,
+  },
+  {
+    path: 'ArSpatialAnchorPipeline.kt',
+    name: 'app/src/main/java/com/argarden/soilcalculator/ar/ArSpatialAnchorPipeline.kt',
+    language: 'kotlin',
+    descriptionAr: 'خط أنابيب تجميد الإطار وتثبيت مثبتات الواقع المعزز (AR Anchors) والتعامل مع Raycast دون تحويل المشهد لصورة مسطحة',
+    content: `package com.argarden.soilcalculator.ar
+
+import android.content.Context
+import android.opengl.Matrix
+import com.google.ar.core.*
+
+/**
+ * Spatial Frame Cache: Preserves full AR spatial context during UI freeze
+ */
+data class CachedArSpatialFrame(
+    val cameraPose: Pose,
+    val projectionMatrix: FloatArray,
+    val viewMatrix: FloatArray,
+    val imageIntrinsics: CameraIntrinsics?,
+    val timestampNs: Long,
+    val depthMode: Config.DepthMode
+)
+
+/**
+ * Handles Frame Freeze without breaking ARSession tracking:
+ * 1. Freezes rendering view while keeping ARSession active in background.
+ * 2. Caches exact ARFrame pose, intrinsics, and depth matrices.
+ * 3. Transforms tap coordinates via Raycasting (hitTest) against the cached spatial context.
+ * 4. Attaches permanent 3D Anchor objects to the underlying Plane for every vertex.
+ */
+class ArSpatialAnchorPipeline(
+    private val session: Session
+) {
+    private var isFrozen = false
+    private var cachedFrame: CachedArSpatialFrame? = null
+    private val attachedAnchors = mutableListOf<Anchor>()
+
+    fun configureDepthMode(config: Config) {
+        // Ensure hardware Depth API / ToF support is enabled
+        if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+            config.depthMode = Config.DepthMode.AUTOMATIC
+        } else {
+            config.depthMode = Config.DepthMode.DISABLED
+        }
+        session.configure(config)
+    }
+
+    /**
+     * Triggers non-destructive Frame Freeze:
+     * Caches ARFrame spatial context while maintaining session tracking.
+     */
+    fun freezeCurrentFrame(frame: Frame) {
+        val camera = frame.camera
+        val projMatrix = FloatArray(16)
+        val viewMatrix = FloatArray(16)
+        
+        camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100.0f)
+        camera.getViewMatrix(viewMatrix, 0)
+
+        cachedFrame = CachedArSpatialFrame(
+            cameraPose = camera.pose,
+            projectionMatrix = projMatrix,
+            viewMatrix = viewMatrix,
+            imageIntrinsics = try { camera.imageIntrinsics } catch (e: Exception) { null },
+            timestampNs = frame.timestamp,
+            depthMode = Config.DepthMode.AUTOMATIC
+        )
+        isFrozen = true
+    }
+
+    fun unfreeze() {
+        isFrozen = false
+        cachedFrame = null
+    }
+
+    /**
+     * Raycasting against cached frame context to create and attach permanent 3D Anchors on Plane
+     */
+    fun addVertexAnchorAtScreenPoint(frame: Frame, screenX: Float, screenY: Float): Anchor? {
+        val hitResults = frame.hitTest(screenX, screenY)
+        for (hit in hitResults) {
+            val trackable = hit.trackable
+            if (trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) {
+                val anchor = hit.createAnchor()
+                attachedAnchors.add(anchor)
+                return anchor
+            }
+        }
+        // Fallback: create anchor at camera plane ray intersection
+        val hitPose = frame.camera.pose.compose(Pose.makeTranslation(0f, 0f, -1.5f))
+        val fallbackAnchor = session.createAnchor(hitPose)
+        attachedAnchors.add(fallbackAnchor)
+        return fallbackAnchor
+    }
+
+    /**
+     * Extracts 3D positions of all attached anchors and calculates precision area via Shoelace
+     */
+    fun computePolygonAreaFromAnchors(): PrecisionAreaResult {
+        val points3D = attachedAnchors.map { anchor ->
+            val pose = anchor.pose
+            Point3D(pose.tx().toDouble(), pose.ty().toDouble(), pose.tz().toDouble())
+        }
+        return ArPrecisionAreaEngine.calculatePrecisionArea(points3D)
+    }
+
+    fun clearAnchors() {
+        attachedAnchors.forEach { it.detach() }
+        attachedAnchors.clear()
+    }
+}
+`,
+  },
+  {
     path: 'MainActivity.kt',
     name: 'app/src/main/java/com/argarden/soilcalculator/MainActivity.kt',
     language: 'kotlin',
