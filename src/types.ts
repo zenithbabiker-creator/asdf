@@ -57,6 +57,45 @@ export interface TurfSeedlingOption {
   labelAr: string; // "10 شتول في المتر المربع (10 شتلة/م²)", etc.
 }
 
+export interface ReferenceCalibrationObject {
+  id: string;
+  nameAr: string;
+  category: 'paper' | 'card' | 'tile' | 'ruler' | 'custom';
+  realWidthM: number;
+  realHeightM: number;
+  realAreaM2: number;
+  descriptionAr: string;
+}
+
+export interface CalibrationSettings {
+  scaleFactor: number; // multiplier applied to real-world calculations (default 1.0)
+  cameraHeightM: number; // e.g. 1.40m
+  manualPitchDeg?: number; // manual override or sensor detected
+  useLiveSensorOrientation: boolean;
+  activeReferenceObject?: ReferenceCalibrationObject;
+  orthogonalSnapEnabled: boolean; // 90 degree corner auto-ortho snapping
+  focalLengthFactor: number; // focal length adjustment factor
+}
+
+export interface LiveSensorOrientation {
+  pitchDeg: number; // beta (-180 to 180) -> ground angle
+  rollDeg: number;  // gamma (-90 to 90) -> lateral tilt
+  yawDeg: number;   // alpha (0 to 360) -> compass direction
+  isAvailable: boolean;
+  isOptimalGroundAngle: boolean; // true if 30 deg <= pitch <= 70 deg
+}
+
+export interface PrecisionPolygonResult {
+  areaM2: number;
+  perimeterM: number;
+  edgeLengthsM: number[];
+  cornerAnglesDeg: number[];
+  centroid3D: Point3D;
+  surfaceNormal: Point3D;
+  scaleFactorApplied: number;
+  anchors: SpatialAnchor3D[];
+}
+
 export interface CalculationResult {
   totalGardenAreaM2: number;
   reservedSelectorsAreaM2: number;

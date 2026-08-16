@@ -1,11 +1,21 @@
-import React, { useRef, useEffect, useState } from 'react';
-import { Point2D, Point3D, SpatialAnchor3D, ARFrameSpatialContext, AREngineType, PreCaptureMeasurementMode } from '../types';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { 
+  Point2D, 
+  Point3D, 
+  SpatialAnchor3D, 
+  ARFrameSpatialContext, 
+  AREngineType, 
+  PreCaptureMeasurementMode,
+  CalibrationSettings,
+  LiveSensorOrientation
+} from '../types';
 import { 
   calculatePrecisionAreaFrom3DAnchors, 
   createSpatialAnchorFromTappedPoint,
   raycastScreenPointTo3DPlane,
   distance3D 
 } from '../utils/arPrecisionMath';
+import { ARCalibrationModal } from './ARCalibrationModal';
 import { Capacitor } from '@capacitor/core';
 import { Camera as CapCamera, CameraResultType, CameraSource, CameraDirection } from '@capacitor/camera';
 import { 
@@ -24,7 +34,9 @@ import {
   Eye,
   Sliders,
   Anchor,
-  ShieldCheck
+  Compass,
+  CheckCircle2,
+  Move
 } from 'lucide-react';
 
 interface ARCameraViewProps {
@@ -38,7 +50,7 @@ interface ARCameraViewProps {
   onDepthCalculated?: (maxDepth: number, avgDepth: number, volumeM3: number) => void;
 }
 
-// Helper to format area precisely in Arabic (e.g. 4.23 m² => 4.23 م² (4 متر مربع و 23 سم²))
+// Helper to format area precisely in Arabic
 export const formatAreaArabicDetailed = (areaM2: number): { primary: string; detailed: string } => {
   if (!areaM2 || areaM2 <= 0) {
     return { primary: '0.00 م²', detailed: '0 متر مربع' };
@@ -56,7 +68,7 @@ export const formatAreaArabicDetailed = (areaM2: number): { primary: string; det
   };
 };
 
-// Helper to format edge distance into meters and centimeters (e.g. 2.15m => 2.15م (2م و 15سم))
+// Helper to format edge distance into meters and centimeters
 export const formatDistanceArabic = (distM: number): string => {
   const wholeM = Math.floor(distM);
   const cm = Math.round((distM - wholeM) * 100);
@@ -101,28 +113,97 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   // UI State: Collapse toolbar option
   const [isToolbarCollapsed, setIsToolbarCollapsed] = useState(false);
 
-  // Physical AR Camera Height & Angle Parameters for Real World Depth Unprojection
-  const CAMERA_HEIGHT_M = 1.40; // 1.4 meters device height above floor
-  const CAMERA_PITCH_RAD = (50 * Math.PI) / 180; // 50 degrees pitch angle to floor plane
-  const FOCAL_LENGTH_PX = 600; // Focal length in canvas pixels
+  // Integrated Calibration & Precision Suite State
+  const [isCalibrationModalOpen, setIsCalibrationModalOpen] = useState(false);
+  const [calibrationSettings, setCalibrationSettings] = useState<CalibrationSettings>({
+    scaleFactor: 1.0,
+    cameraHeightM: 1.40,
+    useLiveSensorOrientation: true,
+    orthogonalSnapEnabled: false,
+    focalLengthFactor: 1.0,
+  });
+
+  // Live Device Physical Sensor State (Gyroscope & Accelerometer)
+  const [sensorOrientation, setSensorOrientation] = useState<LiveSensorOrientation>({
+    pitchDeg: 50.0,
+    rollDeg: 0.0,
+    yawDeg: 0.0,
+    isAvailable: false,
+    isOptimalGroundAngle: true,
+  });
+
+  // Vertex Dragging & Magnifier State
+  const [draggedVertexIndex, setDraggedVertexIndex] = useState<number | null>(null);
+  const [magnifierPos, setMagnifierPos] = useState<Point2D | null>(null);
+
+  // Base Physical Parameters
+  const FOCAL_LENGTH_PX = 600 * calibrationSettings.focalLengthFactor;
+
+  // Active Effective Pitch in Radians (from live sensors or fallback default 50 deg)
+  const effectivePitchRad = calibrationSettings.useLiveSensorOrientation && sensorOrientation.isAvailable
+    ? Math.max(0.15, Math.min(1.45, (sensorOrientation.pitchDeg * Math.PI) / 180))
+    : (50 * Math.PI) / 180;
+
+  const effectiveRollRad = calibrationSettings.useLiveSensorOrientation && sensorOrientation.isAvailable
+    ? (sensorOrientation.rollDeg * Math.PI) / 180
+    : 0.0;
 
   // Simulated depth measurements for hole
-  const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45); // meters
-  const [simulatedAvgDepth, setSimulatedAvgDepth] = useState(0.30); // meters
+  const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45);
+  const [simulatedAvgDepth, setSimulatedAvgDepth] = useState(0.30);
 
-  // Generate or get default AR Frame Spatial Context with Config.DepthMode.AUTOMATIC
-  const getDefaultSpatialFrameContext = (w = 720, h = 420): ARFrameSpatialContext => ({
+  // Device Orientation Listener (Active Sensor Fusion)
+  useEffect(() => {
+    const handleOrientation = (e: DeviceOrientationEvent) => {
+      if (e.beta !== null) {
+        // beta is pitch angle from vertical (-180 to 180)
+        // When device is tilted down towards ground, beta is typically between 30 and 75 degrees
+        const rawPitch = e.beta;
+        const normalizedPitch = Math.max(10, Math.min(85, rawPitch));
+        const rawRoll = e.gamma !== null ? Math.max(-45, Math.min(45, e.gamma)) : 0;
+        const rawYaw = e.alpha !== null ? e.alpha : 0;
+
+        const isOptimal = normalizedPitch >= 30 && normalizedPitch <= 70;
+
+        setSensorOrientation({
+          pitchDeg: normalizedPitch,
+          rollDeg: rawRoll,
+          yawDeg: rawYaw,
+          isAvailable: true,
+          isOptimalGroundAngle: isOptimal,
+        });
+      }
+    };
+
+    if (window.DeviceOrientationEvent) {
+      window.addEventListener('deviceorientation', handleOrientation, true);
+    }
+
+    return () => {
+      if (window.DeviceOrientationEvent) {
+        window.removeEventListener('deviceorientation', handleOrientation, true);
+      }
+    };
+  }, []);
+
+  // Generate AR Frame Spatial Context
+  const getActiveSpatialFrameContext = (w = 720, h = 420): ARFrameSpatialContext => ({
     cameraPose: {
-      position: { x: 0, y: CAMERA_HEIGHT_M, z: 0 },
-      orientation: [0, Math.sin(CAMERA_PITCH_RAD / 2), 0, Math.cos(CAMERA_PITCH_RAD / 2)],
+      position: { x: 0, y: calibrationSettings.cameraHeightM, z: 0 },
+      orientation: [
+        0, 
+        Math.sin(effectivePitchRad / 2), 
+        0, 
+        Math.cos(effectivePitchRad / 2)
+      ],
     },
     intrinsics: {
       focalLengthPx: FOCAL_LENGTH_PX,
       principalPoint: { x: w / 2, y: h / 2 },
       fovDegrees: 68.5,
     },
-    cameraHeightM: CAMERA_HEIGHT_M,
-    cameraPitchRad: CAMERA_PITCH_RAD,
+    cameraHeightM: calibrationSettings.cameraHeightM,
+    cameraPitchRad: effectivePitchRad,
     depthMapAvailable: true,
     depthMode: 'AUTOMATIC',
     timestamp: Date.now(),
@@ -136,7 +217,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       if (typeof CapCamera.requestPermissions === 'function') {
         const status = await CapCamera.requestPermissions({ permissions: ['camera'] });
         if (status.camera !== 'granted' && status.camera !== 'limited') {
-          setCameraError('يرجى منح إذن الكاميرا الحقيقي. تشغيل البث المباشر بالكاميرا الخلفية إجباري للحصول على أبعاد دقيقة بالواقع المعزز.');
+          setCameraError('يرجى منح إذن الكاميرا الحقيقي للوصول للبث المباشر بالكاميرا الخلفية.');
         }
       }
     } catch (e) {
@@ -212,7 +293,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   };
 
   // Freeze Frame & Spatial Anchor Pipeline Trigger
-  // Keeps ARSession and camera feed active in background, caches exact ARFrame spatial context
   const handleTakeSnapshot = async () => {
     try {
       const video = videoRef.current;
@@ -220,11 +300,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       const h = canvasRef.current ? canvasRef.current.height : 420;
 
       // 1. Capture and cache the exact ARFrame spatial context
-      const spatialContext = getDefaultSpatialFrameContext(w, h);
+      const spatialContext = getActiveSpatialFrameContext(w, h);
       setCachedSpatialFrame(spatialContext);
       setIsFrameFrozen(true);
 
-      // 2. Freeze the rendering view by caching current video raster frame
+      // 2. Freeze rendering view by caching current video raster frame
       if (video && video.videoWidth > 0 && video.videoHeight > 0) {
         const tempCanvas = document.createElement('canvas');
         tempCanvas.width = video.videoWidth;
@@ -255,7 +335,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       const started = await startLiveCamera();
       if (!started) {
-        setCameraError('لم يتم منح إذن الكاميرا الحقيقية. يرجى تفعيل إذن الكاميرا في المتصفح لالتقاط الصورة الحقيقية.');
+        setCameraError('لم يتم منح إذن الكاميرا الحقيقية. يرجى تفعيل إذن الكاميرا في المتصفح.');
       }
     } catch (e) {
       console.error('Error capturing camera frame:', e);
@@ -263,7 +343,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     }
   };
 
-  // Helper to load HTMLImageElement from DataURL and start 30s Full Screen mode
+  // Helper to load snapshot
   const loadSnapshotFromDataUrl = (dataUrl: string) => {
     setCapturedSnapshot(dataUrl);
     const img = new Image();
@@ -272,12 +352,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     };
     img.src = dataUrl;
 
-    // Trigger 30-Second Full-Screen Mode upon capture
     setIsFullScreenMode(true);
     setFullScreenCountdown(30);
   };
 
-  // 30-second Full Screen countdown timer effect
+  // 30-second Full Screen countdown timer
   useEffect(() => {
     if (!isFullScreenMode) return;
 
@@ -300,7 +379,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
       const link = document.createElement('a');
-      link.download = `ar_spatial_measurement_${Date.now()}.jpg`;
+      link.download = `ar_calibrated_measurement_${Date.now()}.jpg`;
       link.href = dataUrl;
       link.click();
     } catch (err) {
@@ -331,42 +410,54 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   }, [mode]);
 
   /**
-   * Unproject 2D Canvas Screen Pixel (x, y) to Real 3D Ground Plane (X, Y, Z)
-   * Using cached ARFrame spatial matrix and camera pose.
+   * Unproject 2D Canvas Screen Pixel to Real 3D Ground Plane (X, Y, Z)
    */
-  const unprojectScreenTo3DPlane = (px: number, py: number, width: number, height: number): Point3D => {
-    const frameCtx = cachedSpatialFrame || getDefaultSpatialFrameContext(width, height);
-    return raycastScreenPointTo3DPlane({ x: px, y: py }, frameCtx, width, height);
-  };
+  const unprojectScreenTo3DPlane = useCallback((px: number, py: number, width: number, height: number): Point3D => {
+    const frameCtx = cachedSpatialFrame || getActiveSpatialFrameContext(width, height);
+    return raycastScreenPointTo3DPlane(
+      { x: px, y: py }, 
+      frameCtx, 
+      width, 
+      height,
+      effectiveRollRad
+    );
+  }, [cachedSpatialFrame, calibrationSettings, effectivePitchRad, effectiveRollRad]);
 
   /**
-   * Computes polygon area using 3D Spatial Anchors and Gauss Shoelace on 2D surface projection
+   * Computes polygon area using 3D Spatial Anchors and Gauss Shoelace with Calibration Factor
    */
-  const computePrecisionPolygonArea = (pts: Point2D[], width: number, height: number): {
-    areaM2: number;
-    perimeterM: number;
-    edgeLengthsM: number[];
-    anchors: SpatialAnchor3D[];
-  } => {
+  const computePrecisionPolygonArea = useCallback((pts: Point2D[], width: number, height: number) => {
     if (pts.length < 3) {
-      return { areaM2: 0, perimeterM: 0, edgeLengthsM: [], anchors: [] };
+      return { 
+        areaM2: 0, 
+        perimeterM: 0, 
+        edgeLengthsM: [], 
+        cornerAnglesDeg: [], 
+        anchors: [] 
+      };
     }
 
-    const frameCtx = cachedSpatialFrame || getDefaultSpatialFrameContext(width, height);
-    const anchors = pts.map((pt, idx) => createSpatialAnchorFromTappedPoint(pt, frameCtx, width, height, idx));
+    const frameCtx = cachedSpatialFrame || getActiveSpatialFrameContext(width, height);
+    const anchors = pts.map((pt, idx) => 
+      createSpatialAnchorFromTappedPoint(pt, frameCtx, width, height, idx, effectiveRollRad)
+    );
     const points3D = anchors.map((a) => a.worldPosition);
 
-    const precisionResult = calculatePrecisionAreaFrom3DAnchors(points3D);
+    const precisionResult = calculatePrecisionAreaFrom3DAnchors(
+      points3D, 
+      calibrationSettings.scaleFactor
+    );
 
     return {
       areaM2: precisionResult.areaM2,
       perimeterM: precisionResult.perimeterM,
       edgeLengthsM: precisionResult.edgeLengthsM,
+      cornerAnglesDeg: precisionResult.cornerAnglesDeg,
       anchors,
     };
-  };
+  }, [cachedSpatialFrame, calibrationSettings, effectiveRollRad, effectivePitchRad]);
 
-  const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS'>('FREEHAND');
+  const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS' | 'ADJUST_VERTEX'>('FREEHAND');
   const [isDragging, setIsDragging] = useState(false);
 
   const pointsRef = useRef<Point2D[]>(points);
@@ -402,6 +493,26 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const coords = getCanvasCoords(e);
     if (!coords || !canvasRef.current) return;
 
+    // Check if tapping near an existing vertex to drag & adjust with precision loupe
+    const currentPts = pointsRef.current;
+    let closestIndex = -1;
+    let closestDist = 28; // touch radius in pixels
+
+    for (let i = 0; i < currentPts.length; i++) {
+      const d = Math.hypot(coords.x - currentPts[i].x, coords.y - currentPts[i].y);
+      if (d < closestDist) {
+        closestDist = d;
+        closestIndex = i;
+      }
+    }
+
+    if (closestIndex !== -1) {
+      setDraggedVertexIndex(closestIndex);
+      setMagnifierPos(coords);
+      setIsDragging(true);
+      return;
+    }
+
     setIsDragging(true);
 
     if (drawTool === 'FREEHAND') {
@@ -412,7 +523,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       setSpatialAnchors(res.anchors);
       if (onAreaCalculated) onAreaCalculated(res.areaM2);
     } else {
-      const currentPts = pointsRef.current;
       if (currentPts.length > 0) {
         const lastPt = currentPts[currentPts.length - 1];
         const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
@@ -428,11 +538,27 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (mode !== 'SURFACE' || !isDragging || drawTool !== 'FREEHAND' || !canvasRef.current) return;
+    if (mode !== 'SURFACE' || !isDragging || !canvasRef.current) return;
     if (e.cancelable) e.preventDefault();
 
     const coords = getCanvasCoords(e);
     if (!coords) return;
+
+    // Handle Dragging Existing Vertex
+    if (draggedVertexIndex !== null) {
+      setMagnifierPos(coords);
+      const currentPts = [...pointsRef.current];
+      currentPts[draggedVertexIndex] = coords;
+      pointsRef.current = currentPts;
+      setPoints(currentPts);
+
+      const res = computePrecisionPolygonArea(currentPts, canvasRef.current.width, canvasRef.current.height);
+      setSpatialAnchors(res.anchors);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2);
+      return;
+    }
+
+    if (drawTool !== 'FREEHAND') return;
 
     const currentPts = pointsRef.current;
     if (currentPts.length > 0) {
@@ -458,6 +584,8 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
     if (isDragging) {
       setIsDragging(false);
+      setDraggedVertexIndex(null);
+      setMagnifierPos(null);
       setPoints([...pointsRef.current]);
     }
   };
@@ -517,9 +645,9 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
 
-      // Render Perspective Corrected Grid (Plane Grid Equalization)
+      // Render Perspective Grid
       ctx.save();
-      ctx.strokeStyle = 'rgba(52, 211, 153, 0.25)';
+      ctx.strokeStyle = 'rgba(52, 211, 153, 0.22)';
       ctx.lineWidth = 1;
       const horizonY = canvas.height * 0.32;
       for (let x = -200; x <= canvas.width + 200; x += 60) {
@@ -536,14 +664,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       }
       ctx.restore();
 
-      // Equalized AR Scale Bar (Perspective corrected at lower ground level)
+      // Equalized AR Scale Bar
       ctx.save();
       const scaleBarX = 20;
       const scaleBarY = canvas.height - 20;
-
-      // Unproject 1 meter on floor plane at bottom screen
-      const pt1_3D = unprojectScreenTo3DPlane(scaleBarX, scaleBarY, canvas.width, canvas.height);
-      const pxFor1M = 180; // Scaled pixels for 1.0m on equalized ground
+      const pxFor1M = 180 * calibrationSettings.scaleFactor;
 
       ctx.strokeStyle = '#34d399';
       ctx.lineWidth = 3;
@@ -556,17 +681,59 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       ctx.lineTo(scaleBarX + pxFor1M, scaleBarY + 6);
       ctx.stroke();
 
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      ctx.fillRect(scaleBarX, scaleBarY - 24, 115, 18);
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+      ctx.fillRect(scaleBarX, scaleBarY - 24, 135, 18);
       ctx.fillStyle = '#34d399';
       ctx.font = 'bold 10px sans-serif';
-      ctx.fillText('📐 1.0م (معايرة AR)', scaleBarX + 6, scaleBarY - 11);
+      ctx.fillText(`📐 1.0م (معاير ${calibrationSettings.scaleFactor.toFixed(2)}x)`, scaleBarX + 6, scaleBarY - 11);
       ctx.restore();
+
+      // Live Spirit Level Indicator (Inclinometer) in top corner
+      if (!isFullScreenMode) {
+        ctx.save();
+        const levelCenterX = 36;
+        const levelCenterY = 36;
+        const levelRadius = 18;
+
+        ctx.beginPath();
+        ctx.arc(levelCenterX, levelCenterY, levelRadius, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+        ctx.fill();
+        ctx.strokeStyle = sensorOrientation.isOptimalGroundAngle ? '#34d399' : '#f59e0b';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Level crosshair
+        ctx.beginPath();
+        ctx.moveTo(levelCenterX - levelRadius + 4, levelCenterY);
+        ctx.lineTo(levelCenterX + levelRadius - 4, levelCenterY);
+        ctx.moveTo(levelCenterX, levelCenterY - levelRadius + 4);
+        ctx.lineTo(levelCenterX, levelCenterY + levelRadius - 4);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Moving bubble based on roll & pitch deviation from 50 deg
+        const pitchDev = (sensorOrientation.pitchDeg - 50) * 0.4;
+        const rollDev = sensorOrientation.rollDeg * 0.4;
+        const bubbleX = Math.max(levelCenterX - 10, Math.min(levelCenterX + 10, levelCenterX + rollDev));
+        const bubbleY = Math.max(levelCenterY - 10, Math.min(levelCenterY + 10, levelCenterY + pitchDev));
+
+        ctx.beginPath();
+        ctx.arc(bubbleX, bubbleY, 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = sensorOrientation.isOptimalGroundAngle ? '#10b981' : '#f59e0b';
+        ctx.fill();
+
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.fillText(`${sensorOrientation.pitchDeg.toFixed(0)}°`, levelCenterX + levelRadius + 6, levelCenterY + 3);
+        ctx.restore();
+      }
 
       // AR Engine Active Status Badge
       if (!isFullScreenMode) {
         ctx.save();
-        ctx.fillStyle = engine === 'HUAWEI_AR_ENGINE' ? 'rgba(225, 29, 72, 0.85)' : 'rgba(2, 132, 199, 0.85)';
+        ctx.fillStyle = engine === 'HUAWEI_AR_ENGINE' ? 'rgba(225, 29, 72, 0.88)' : 'rgba(2, 132, 199, 0.88)';
         ctx.font = 'bold 11px sans-serif';
         const engineText = engine === 'HUAWEI_AR_ENGINE' ? 'Huawei AR Engine TrueDepth' : 'Google ARCore TrueDepth';
         ctx.fillRect(canvas.width - 180, 12, 168, 24);
@@ -577,15 +744,15 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         if (capturedSnapshot) {
           ctx.save();
           ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
-          ctx.fillRect(12, 12, 165, 24);
+          ctx.fillRect(72, 12, 165, 24);
           ctx.fillStyle = '#ffffff';
           ctx.font = 'bold 11px sans-serif';
-          ctx.fillText('📷 لقطة AR حقيقية متكافئة', 20, 28);
+          ctx.fillText('📷 لقطة AR حقيقية متكافئة', 80, 28);
           ctx.restore();
         }
       }
 
-      // Render Mode Overlays based on Pre-Capture Mode Selection (REAL_AREA, REAL_DEPTH, or REAL_AREA_AND_DEPTH)
+      // Render Mode Overlays based on Pre-Capture Mode Selection
       const shouldDrawArea = preCaptureMode === 'REAL_AREA' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'SURFACE';
       const shouldDrawDepth = preCaptureMode === 'REAL_DEPTH' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'HOLE_DEPTH';
 
@@ -607,7 +774,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // Draw Centroid Badge displaying exact area in m² and detailed Arabic format
+            // Centroid Badge displaying exact calibrated area in m²
             let sumX = 0, sumY = 0;
             pts.forEach((p) => {
               sumX += p.x;
@@ -620,12 +787,12 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             const areaFormatted = formatAreaArabicDetailed(precisionCalc.areaM2);
 
             ctx.save();
-            ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
             ctx.strokeStyle = '#34d399';
             ctx.lineWidth = 1.5;
 
-            const boxW = 220;
-            const boxH = 44;
+            const boxW = 230;
+            const boxH = 46;
             ctx.beginPath();
             ctx.roundRect(centroidX - boxW / 2, centroidY - boxH / 2, boxW, boxH, 10);
             ctx.fill();
@@ -634,13 +801,13 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.fillStyle = '#34d399';
             ctx.font = 'bold 12px sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText(`المساحة الدقيقة: ${areaFormatted.primary}`, centroidX, centroidY - 7);
+            ctx.fillText(`المساحة المعايرة: ${areaFormatted.primary}`, centroidX, centroidY - 8);
             ctx.fillStyle = '#a7f3d0';
             ctx.font = 'bold 10px sans-serif';
-            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 8);
+            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 7);
             ctx.fillStyle = '#6ee7b7';
             ctx.font = '9px sans-serif';
-            ctx.fillText(`محيط: ${precisionCalc.perimeterM}م | خوارزمية Shoelace 3D`, centroidX, centroidY + 19);
+            ctx.fillText(`محيط: ${precisionCalc.perimeterM}م | معامل الدقة: ${calibrationSettings.scaleFactor.toFixed(3)}x`, centroidX, centroidY + 18);
             ctx.restore();
           }
 
@@ -659,15 +826,15 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               ctx.lineWidth = 2.5;
               ctx.stroke();
 
-              // Calculate 3D Real Floor Distance in Meters via true 3D Anchors
+              // Calculate 3D Real Distance in Meters
               const p1_3D = unprojectScreenTo3DPlane(p1.x, p1.y, canvas.width, canvas.height);
               const p2_3D = unprojectScreenTo3DPlane(p2.x, p2.y, canvas.width, canvas.height);
-              const dist3DMVal = distance3D(p1_3D, p2_3D);
-              const distText = formatDistanceArabic(dist3DMVal);
+              const rawDist = distance3D(p1_3D, p2_3D) * calibrationSettings.scaleFactor;
+              const distText = formatDistanceArabic(rawDist);
 
               const midX = (p1.x + p2.x) / 2;
               const midY = (p1.y + p2.y) / 2;
-              ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+              ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
               ctx.fillRect(midX - 38, midY - 12, 76, 22);
               ctx.fillStyle = '#34d399';
               ctx.fillText(distText, midX, midY + 3);
@@ -676,17 +843,19 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
           // Draw Points Vertices & 3D Spatial Anchor Rings
           pts.forEach((pt, index) => {
+            const isDragged = draggedVertexIndex === index;
+
             // Outer Anchor Halo
             ctx.beginPath();
-            ctx.arc(pt.x, pt.y, 14, 0, Math.PI * 2);
-            ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
-            ctx.lineWidth = 1.5;
+            ctx.arc(pt.x, pt.y, isDragged ? 18 : 14, 0, Math.PI * 2);
+            ctx.strokeStyle = isDragged ? '#fbbf24' : 'rgba(52, 211, 153, 0.45)';
+            ctx.lineWidth = 2;
             ctx.stroke();
 
             // Inner Vertex
             ctx.beginPath();
             ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
-            ctx.fillStyle = '#10b981';
+            ctx.fillStyle = isDragged ? '#f59e0b' : '#10b981';
             ctx.fill();
             ctx.strokeStyle = '#ffffff';
             ctx.lineWidth = 2.5;
@@ -696,6 +865,49 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.font = 'bold 10px sans-serif';
             ctx.fillText(`${index + 1}`, pt.x - 3, pt.y + 3);
           });
+
+          // Magnifier Loupe when dragging vertex
+          if (magnifierPos && draggedVertexIndex !== null) {
+            const loupeRadius = 38;
+            const loupeX = Math.max(loupeRadius + 10, Math.min(canvas.width - loupeRadius - 10, magnifierPos.x));
+            const loupeY = Math.max(loupeRadius + 10, magnifierPos.y - 65);
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(loupeX, loupeY, loupeRadius, 0, Math.PI * 2);
+            ctx.clip();
+
+            // Draw zoomed area
+            if (snapshotImageObj) {
+              ctx.drawImage(
+                snapshotImageObj,
+                magnifierPos.x - 20, magnifierPos.y - 20, 40, 40,
+                loupeX - loupeRadius, loupeY - loupeRadius, loupeRadius * 2, loupeRadius * 2
+              );
+            } else {
+              ctx.fillStyle = '#1e293b';
+              ctx.fillRect(loupeX - loupeRadius, loupeY - loupeRadius, loupeRadius * 2, loupeRadius * 2);
+            }
+
+            // Loupe crosshair
+            ctx.strokeStyle = '#fbbf24';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(loupeX - 15, loupeY);
+            ctx.lineTo(loupeX + 15, loupeY);
+            ctx.moveTo(loupeX, loupeY - 15);
+            ctx.lineTo(loupeX, loupeY + 15);
+            ctx.stroke();
+
+            ctx.restore();
+
+            // Loupe border
+            ctx.beginPath();
+            ctx.arc(loupeX, loupeY, loupeRadius, 0, Math.PI * 2);
+            ctx.strokeStyle = '#fbbf24';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+          }
         }
       }
 
@@ -729,7 +941,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           ctx.arc(centerX, centerY, 12, 0, Math.PI * 2);
           ctx.stroke();
 
-          // Physical Camera Distance & Pit Depth Badge
           ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
           ctx.fillRect(centerX - 100, centerY - 50, 200, 36);
           ctx.strokeStyle = '#f59e0b';
@@ -739,7 +950,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
           ctx.fillStyle = '#fbbf24';
           ctx.font = 'bold 11px sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText(`مسافة العدسة للسطح: 1.40م (140سم)`, centerX, centerY - 35);
+          ctx.fillText(`مسافة العدسة للسطح: ${calibrationSettings.cameraHeightM.toFixed(2)}م`, centerX, centerY - 35);
           ctx.fillStyle = '#f87171';
           ctx.font = 'bold 10px sans-serif';
           ctx.fillText(`عمق الحفرة الفيزيائي: -${simulatedMaxDepth} م`, centerX, centerY - 20);
@@ -763,12 +974,57 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [mode, preCaptureMode, points, isCameraActive, capturedSnapshot, snapshotImageObj, engine, showDepthHeatmap, simulatedMaxDepth, isFullScreenMode]);
+  }, [
+    mode, 
+    preCaptureMode, 
+    points, 
+    isCameraActive, 
+    capturedSnapshot, 
+    snapshotImageObj, 
+    engine, 
+    showDepthHeatmap, 
+    simulatedMaxDepth, 
+    isFullScreenMode,
+    sensorOrientation,
+    calibrationSettings,
+    magnifierPos,
+    draggedVertexIndex,
+    computePrecisionPolygonArea,
+    unprojectScreenTo3DPlane
+  ]);
+
+  // Current measured area for the calibration modal
+  const currentPolygonResult = computePrecisionPolygonArea(
+    points, 
+    canvasRef.current ? canvasRef.current.width : 720, 
+    canvasRef.current ? canvasRef.current.height : 420
+  );
 
   return (
     <div className={`relative w-full rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 shadow-xl transition-all duration-300 ${
       isFullScreenMode ? 'fixed inset-0 z-50 rounded-none border-none h-screen w-screen' : 'min-h-[360px]'
     }`}>
+      {/* Integrated AR Calibration Modal */}
+      <ARCalibrationModal
+        isOpen={isCalibrationModalOpen}
+        onClose={() => setIsCalibrationModalOpen(false)}
+        settings={calibrationSettings}
+        onUpdateSettings={(newSettings) => {
+          setCalibrationSettings(newSettings);
+          // Recalculate area with new settings
+          if (points.length >= 3 && canvasRef.current && onAreaCalculated) {
+            const res = calculatePrecisionAreaFrom3DAnchors(
+              spatialAnchors.map((a) => a.worldPosition),
+              newSettings.scaleFactor
+            );
+            onAreaCalculated(res.areaM2);
+          }
+        }}
+        sensorOrientation={sensorOrientation}
+        currentMeasuredAreaM2={currentPolygonResult.areaM2}
+        currentMeasuredPerimeterM={currentPolygonResult.perimeterM}
+      />
+
       {/* Prompt overlay to grant real camera permission if live camera stream is inactive */}
       {!isCameraActive && !capturedSnapshot && (
         <div className="absolute inset-0 z-25 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-4">
@@ -837,34 +1093,39 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Pre-Capture Mode Status Bar & Switcher Button */}
-      {!isFullScreenMode && onOpenModeSelection && (
+      {/* Top Precision Calibration HUD Bar */}
+      {!isFullScreenMode && (
         <div className="absolute top-3 right-3 left-3 z-30 flex flex-wrap items-center justify-between gap-2 p-2 px-3 bg-slate-900/90 border border-slate-700/80 rounded-2xl text-white text-xs backdrop-blur-md shadow-xl">
           <div className="flex items-center gap-2 overflow-hidden">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
-            <span className="font-bold text-emerald-300 whitespace-nowrap">الوضع النشط:</span>
-            <span className="font-extrabold text-white truncate">
-              {preCaptureMode === 'REAL_AREA' && 'حساب المساحة الحقيقية (Real Area) 📐'}
-              {preCaptureMode === 'REAL_DEPTH' && 'حساب العمق الحقيقي (Real Depth) 🎯'}
-              {preCaptureMode === 'REAL_AREA_AND_DEPTH' && 'حساب المساحة والعمق الحقيقي معاً ⚡'}
+            <span className="font-bold text-emerald-300 whitespace-nowrap">المنظومة:</span>
+            <span className="font-extrabold text-white truncate flex items-center gap-1.5">
+              <span>{calibrationSettings.scaleFactor === 1.0 ? 'معايرة قياسية (1.00x)' : `معايرة مخصصة (${calibrationSettings.scaleFactor.toFixed(3)}x)`}</span>
+              <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">| ارتفاع: {calibrationSettings.cameraHeightM.toFixed(2)}م</span>
+              <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline">| زاوية: {sensorOrientation.pitchDeg.toFixed(0)}°</span>
             </span>
           </div>
 
-          <button
-            onClick={onOpenModeSelection}
-            className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs flex items-center gap-1 transition-all shadow-xs flex-shrink-0 cursor-pointer"
-          >
-            <Sliders className="w-3.5 h-3.5" />
-            <span>تغيير وضع القياس 🔄</span>
-          </button>
-        </div>
-      )}
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {/* Open Calibration Suite */}
+            <button
+              onClick={() => setIsCalibrationModalOpen(true)}
+              className="px-2.5 py-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition-all shadow-xs cursor-pointer border border-emerald-400/30"
+              title="فتح منظومة المعايرة والضبط المكاني"
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              <span>معايرة القياس ⚙️</span>
+            </button>
 
-      {/* Touch Drawing Instruction Banner */}
-      {mode === 'SURFACE' && !isFullScreenMode && !onOpenModeSelection && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-slate-900/90 text-emerald-300 border border-emerald-500/40 px-3 py-1.5 rounded-full text-[11px] font-semibold flex items-center gap-1.5 shadow-lg backdrop-blur-md pointer-events-none">
-          <Pencil className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
-          <span>مرر إصبعك على بث الكاميرا لترسم وتحدد المساحة مباشرة ✏️</span>
+            {onOpenModeSelection && (
+              <button
+                onClick={onOpenModeSelection}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-medium text-xs flex items-center gap-1 transition-all border border-slate-700 cursor-pointer"
+              >
+                <span>الوضع 🔄</span>
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -886,7 +1147,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       {/* Camera Error Alert */}
       {cameraError && !capturedSnapshot && !isFullScreenMode && (
-        <div className="absolute top-3 left-3 right-3 z-20 bg-slate-900/95 text-slate-100 border border-amber-500/50 text-xs p-3 rounded-xl flex items-center justify-between gap-2 shadow-xl backdrop-blur-md">
+        <div className="absolute top-16 left-3 right-3 z-20 bg-slate-900/95 text-slate-100 border border-amber-500/50 text-xs p-3 rounded-xl flex items-center justify-between gap-2 shadow-xl backdrop-blur-md">
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
             <span className="leading-relaxed">{cameraError}</span>
@@ -909,22 +1170,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         </div>
       )}
 
-      {/* Toggle Full Screen Button when Snapshot Captured */}
-      {capturedSnapshot && !isFullScreenMode && (
-        <button
-          onClick={() => {
-            setIsFullScreenMode(true);
-            setFullScreenCountdown(30);
-          }}
-          className="absolute top-3 right-3 z-30 bg-slate-900/90 hover:bg-slate-800 text-emerald-400 border border-emerald-500/40 p-2 rounded-xl shadow-2xl backdrop-blur-md flex items-center gap-1.5 text-xs font-bold transition-all"
-          title="تفعيل وضع الشاشة الكاملة لمدة 30 ثانية للتحديد بدون عوائق"
-        >
-          <Maximize2 className="w-4 h-4" />
-          <span>شاشة كاملة (30 ثانية) 🔍</span>
-        </button>
-      )}
-
-      {/* Main Action Bar (Hidden during Full Screen Mode) */}
+      {/* Main Action Bar */}
       {!isFullScreenMode && !isToolbarCollapsed && (
         <div className="absolute bottom-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-2xl bg-slate-900/90 backdrop-blur-md border border-slate-700/60 text-white text-xs shadow-2xl max-h-40 overflow-y-auto">
           <div className="flex items-center gap-2 flex-wrap">
