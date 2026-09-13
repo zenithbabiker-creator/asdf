@@ -2,6 +2,27 @@ export type AREngineType = 'GOOGLE_ARCORE' | 'HUAWEI_AR_ENGINE';
 
 export type PreCaptureMeasurementMode = 'REAL_AREA' | 'REAL_DEPTH' | 'REAL_AREA_AND_DEPTH';
 
+export type SpatialMeasurementMode = 'HORIZONTAL_AREA' | 'VERTICAL_HEIGHT' | 'EXCAVATION_DEPTH_VOLUME';
+
+export interface VerticalHeightResult {
+  heightM: number;               // Vertical height strictly along gravity vector: H = |Y_top - Y_bottom|
+  topPoint3D: Point3D;
+  bottomPoint3D: Point3D;
+  horizontalOffsetM: number;
+  straightDistanceM: number;     // 3D Euclidean distance
+  planeType: 'VERTICAL';
+}
+
+export interface SoilVolumeResult {
+  surfaceAreaM2: number;         // 2D projected 3D surface area (m^2)
+  measuredDepthM: number;        // Measured depth along normal/gravity vector (m)
+  volumeM3: number;              // V = Area * Depth (m^3)
+  volumeLiters: number;          // V * 1000
+  estimatedSoilBags50L: number;  // Volume in liters / 50
+  estimatedTruckloadsM3: number; // Volume / 6.0 (approx 6m^3 truck)
+  depthPointsCount: number;
+}
+
 export interface Point2D {
   x: number;
   y: number;
@@ -94,6 +115,25 @@ export interface PrecisionPolygonResult {
   surfaceNormal: Point3D;
   scaleFactorApplied: number;
   anchors: SpatialAnchor3D[];
+  boundingBoxM?: { widthM: number; lengthM: number };
+}
+
+export interface FusedPrecisionAreaResult {
+  areaM2: number;                       // Final invariant fused area in m^2
+  areaShoelace3DM2: number;             // Strategy 1 (3D Raycasting Shoelace)
+  areaHomographyBirdEyeM2: number;      // Strategy 2 (Planar Homography Bird's Eye View)
+  strategyDiscrepancyPercent: number;    // |AreaA - AreaB| / Avg * 100
+  convergenceIterCount: number;         // Number of optimization iterations
+  optimizedPitchDeg: number;            // Optimized/used pitch angle in degrees
+  perimeterM: number;                   // Perimeter in meters
+  edgeLengthsM: number[];               // Metric lengths of each edge
+  vertexDepthsM: number[];              // Individual ray metric depth for each vertex (Strategy 3)
+  vertexMetricScaleMPerPx: number[];    // Dynamic scale-per-pixel (m/px) for each vertex (Strategy 3)
+  homographyMatrix: number[][];         // 3x3 Homography Matrix (Strategy 2)
+  birdEyeCoordinates: Point2D[];        // Orthorectified metric (X, Z) coordinates (Strategy 2)
+  centroid3D: Point3D;
+  surfaceNormal: Point3D;
+  boundingBoxM: { widthM: number; lengthM: number };
 }
 
 export interface CalculationResult {

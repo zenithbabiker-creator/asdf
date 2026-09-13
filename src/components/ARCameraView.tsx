@@ -6,13 +6,22 @@ import {
   ARFrameSpatialContext, 
   AREngineType, 
   PreCaptureMeasurementMode,
+  SpatialMeasurementMode,
+  VerticalHeightResult,
+  SoilVolumeResult,
   CalibrationSettings,
-  LiveSensorOrientation
+  LiveSensorOrientation,
+  FusedPrecisionAreaResult
 } from '../types';
 import { 
   calculatePrecisionAreaFrom3DAnchors, 
   createSpatialAnchorFromTappedPoint,
   raycastScreenPointTo3DPlane,
+  raycastScreenPointToVerticalPlane,
+  fusedPrecisionAreaCalculation,
+  computeCornerAnglesDeg,
+  computeVerticalHeight,
+  computeSoilExcavationVolume,
   distance3D 
 } from '../utils/arPrecisionMath';
 import { ARCalibrationModal } from './ARCalibrationModal';
@@ -36,7 +45,14 @@ import {
   Anchor,
   Compass,
   CheckCircle2,
-  Move
+  Move,
+  Square,
+  Circle,
+  Ruler,
+  Building2,
+  Box,
+  ArrowDownUp,
+  Grid
 } from 'lucide-react';
 
 interface ARCameraViewProps {
@@ -46,9 +62,11 @@ interface ARCameraViewProps {
   points: Point2D[];
   setPoints: React.Dispatch<React.SetStateAction<Point2D[]>>;
   engine: AREngineType;
-  onAreaCalculated?: (areaM2: number) => void;
-  onDepthCalculated?: (maxDepth: number, avgDepth: number, volumeM3: number) => void;
+  onAreaCalculated?: (areaM2: number, perimeterM?: number, widthM?: number, lengthM?: number) => void;
+  onDepthCalculated?: (maxDepth: number, avgDepth: number, volumeM3: number, holeAreaM2?: number, widthM?: number, lengthM?: number) => void;
 }
+
+export type DrawToolType = 'TAP_POINTS' | 'RECTANGLE' | 'TAPE' | 'CIRCLE' | 'FREEHAND' | 'ADJUST_VERTEX';
 
 // Helper to format area precisely in Arabic
 export const formatAreaArabicDetailed = (areaM2: number): { primary: string; detailed: string } => {
@@ -148,9 +166,59 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     ? (sensorOrientation.rollDeg * Math.PI) / 180
     : 0.0;
 
+  // Rule 6: Multi-Mode Spatial Engine (Horizontal Area vs Vertical Height vs Excavation Depth & Volume)
+  const [spatialMode, setSpatialMode] = useState<SpatialMeasurementMode>(
+    mode === 'HOLE_DEPTH' ? 'EXCAVATION_DEPTH_VOLUME' : 'HORIZONTAL_AREA'
+  );
+  const [verticalHeightResult, setVerticalHeightResult] = useState<VerticalHeightResult | null>(null);
+  const [soilVolumeResult, setSoilVolumeResult] = useState<SoilVolumeResult | null>(null);
+  const [excavationDepthM, setExcavationDepthM] = useState<number>(0.35);
+  const [wallDistanceM, setWallDistanceM] = useState<number>(2.5);
+
   // Simulated depth measurements for hole
   const [simulatedMaxDepth, setSimulatedMaxDepth] = useState(0.45);
   const [simulatedAvgDepth, setSimulatedAvgDepth] = useState(0.30);
+
+  // AR Tracking Quality & Motion Guard State (Rule B & Rule E)
+  const [arTrackingState, setArTrackingState] = useState<'TRACKING' | 'PAUSED' | 'STOPPED' | 'SCAN_REQUIRED'>('TRACKING');
+  const [isHighVelocity, setIsHighVelocity] = useState<boolean>(false);
+  const [guardWarningMessage, setGuardWarningMessage] = useState<string | null>(null);
+
+  // Device Motion & Gyroscope Delta Listener (Rule E: Environmental Guardrails & Motion Drift Prevention)
+  useEffect(() => {
+    let velocityTimeout: any = null;
+
+    const handleMotion = (e: DeviceMotionEvent) => {
+      const acc = e.accelerationIncludingGravity || e.acceleration;
+      if (acc && acc.x !== null && acc.y !== null && acc.z !== null) {
+        const magnitude = Math.hypot(acc.x, acc.y, acc.z);
+        // Earth gravity is ~9.81 m/s^2. Deviation > 4.5 m/s^2 indicates high device velocity / violent shake
+        const dynamicAcc = Math.abs(magnitude - 9.81);
+        
+        if (dynamicAcc > 4.2) {
+          setIsHighVelocity(true);
+          setGuardWarningMessage('أبطئ حركة الجهاز (Slow Down Device) لتفادي انحراف التتبع المكاني');
+          
+          if (velocityTimeout) clearTimeout(velocityTimeout);
+          velocityTimeout = setTimeout(() => {
+            setIsHighVelocity(false);
+            setGuardWarningMessage(null);
+          }, 1800);
+        }
+      }
+    };
+
+    if (window.DeviceMotionEvent) {
+      window.addEventListener('devicemotion', handleMotion, true);
+    }
+
+    return () => {
+      if (window.DeviceMotionEvent) {
+        window.removeEventListener('devicemotion', handleMotion, true);
+      }
+      if (velocityTimeout) clearTimeout(velocityTimeout);
+    };
+  }, []);
 
   // Device Orientation Listener (Active Sensor Fusion)
   useEffect(() => {
@@ -424,7 +492,11 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   }, [cachedSpatialFrame, calibrationSettings, effectivePitchRad, effectiveRollRad]);
 
   /**
-   * Computes polygon area using 3D Spatial Anchors and Gauss Shoelace with Calibration Factor
+   * Computes distance-invariant polygon area using Multi-Strategy Fusion:
+   * (1) Metric World-Space Raycasting & 3D Shoelace
+   * (2) Planar Homography Orthorectification (Bird's Eye View)
+   * (3) Dynamic Slant-Depth & Scale-per-Pixel Calibration
+   * (4) Iterative Convergence & Discrepancy Cross-Verification
    */
   const computePrecisionPolygonArea = useCallback((pts: Point2D[], width: number, height: number) => {
     if (pts.length < 3) {
@@ -433,31 +505,40 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         perimeterM: 0, 
         edgeLengthsM: [], 
         cornerAnglesDeg: [], 
-        anchors: [] 
+        anchors: [],
+        fusedResult: undefined,
+        boundingBoxM: undefined
       };
     }
 
     const frameCtx = cachedSpatialFrame || getActiveSpatialFrameContext(width, height);
-    const anchors = pts.map((pt, idx) => 
-      createSpatialAnchorFromTappedPoint(pt, frameCtx, width, height, idx, effectiveRollRad)
-    );
-    const points3D = anchors.map((a) => a.worldPosition);
-
-    const precisionResult = calculatePrecisionAreaFrom3DAnchors(
-      points3D, 
+    
+    // Multi-Strategy Fusion Calculation
+    const fused = fusedPrecisionAreaCalculation(
+      pts,
+      frameCtx,
+      width,
+      height,
+      effectiveRollRad,
       calibrationSettings.scaleFactor
     );
 
+    const anchors = pts.map((pt, idx) => 
+      createSpatialAnchorFromTappedPoint(pt, frameCtx, width, height, idx, effectiveRollRad)
+    );
+
     return {
-      areaM2: precisionResult.areaM2,
-      perimeterM: precisionResult.perimeterM,
-      edgeLengthsM: precisionResult.edgeLengthsM,
-      cornerAnglesDeg: precisionResult.cornerAnglesDeg,
+      areaM2: fused.areaM2,
+      perimeterM: fused.perimeterM,
+      edgeLengthsM: fused.edgeLengthsM,
+      cornerAnglesDeg: computeCornerAnglesDeg(fused.birdEyeCoordinates.map(b => ({ x: b.x, y: 0, z: b.y }))),
       anchors,
+      boundingBoxM: fused.boundingBoxM,
+      fusedResult: fused,
     };
   }, [cachedSpatialFrame, calibrationSettings, effectiveRollRad, effectivePitchRad]);
 
-  const [drawTool, setDrawTool] = useState<'FREEHAND' | 'TAP_POINTS' | 'ADJUST_VERTEX'>('FREEHAND');
+  const [drawTool, setDrawTool] = useState<DrawToolType>('TAP_POINTS');
   const [isDragging, setIsDragging] = useState(false);
 
   const pointsRef = useRef<Point2D[]>(points);
@@ -483,7 +564,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (mode !== 'SURFACE') return;
     if (e.cancelable) e.preventDefault();
 
     try {
@@ -492,6 +572,17 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
     const coords = getCanvasCoords(e);
     if (!coords || !canvasRef.current) return;
+
+    // Rule B & Rule E: Tracking Validation Layer & Environmental Guardrails
+    if (arTrackingState !== 'TRACKING') {
+      setGuardWarningMessage('حالة التتبع غير مستقرة. يرجى مسح السطح لتثبيت المستوى الأفقي (Surface Scan Required).');
+      return;
+    }
+
+    if (isHighVelocity) {
+      setGuardWarningMessage('أبطئ حركة الجهاز (Slow Down Device) لمنع انحراف التتبع المكاني.');
+      return;
+    }
 
     // Check if tapping near an existing vertex to drag & adjust with precision loupe
     const currentPts = pointsRef.current;
@@ -515,30 +606,164 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
     setIsDragging(true);
 
-    if (drawTool === 'FREEHAND') {
+    // RULE 6: Spatial Mode - Vertical Plane & Height Mode (H = |Y_top - Y_bottom|)
+    if (spatialMode === 'VERTICAL_HEIGHT') {
+      let newPts: Point2D[];
+      if (currentPts.length === 0 || currentPts.length >= 2) {
+        newPts = [coords];
+        setVerticalHeightResult(null);
+      } else {
+        newPts = [currentPts[0], coords];
+        const frameCtx = cachedSpatialFrame || getActiveSpatialFrameContext(canvasRef.current.width, canvasRef.current.height);
+        const vHeight = computeVerticalHeight(
+          newPts[0],
+          newPts[1],
+          frameCtx,
+          canvasRef.current.width,
+          canvasRef.current.height,
+          wallDistanceM,
+          effectiveRollRad
+        );
+        setVerticalHeightResult(vHeight);
+        if (onDepthCalculated) {
+          onDepthCalculated(vHeight.heightM, vHeight.heightM, 0, 0);
+        }
+        if (onAreaCalculated) {
+          onAreaCalculated(0, vHeight.heightM);
+        }
+      }
+      pointsRef.current = newPts;
+      setPoints(newPts);
+      return;
+    }
+
+    // RULE 6: Spatial Mode - Soil Excavation Depth & Volume (V = Area * Depth)
+    if (spatialMode === 'EXCAVATION_DEPTH_VOLUME') {
+      if (currentPts.length >= 3) {
+        const firstPt = currentPts[0];
+        const distToFirst = Math.hypot(coords.x - firstPt.x, coords.y - firstPt.y);
+        if (distToFirst < 25) {
+          const res = computePrecisionPolygonArea(currentPts, canvasRef.current.width, canvasRef.current.height);
+          const vol = computeSoilExcavationVolume(res.areaM2, excavationDepthM, currentPts.length);
+          setSoilVolumeResult(vol);
+          if (onDepthCalculated) {
+            onDepthCalculated(excavationDepthM, excavationDepthM, vol.volumeM3, res.areaM2, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+          }
+          return;
+        }
+      }
+
+      const newPts = [...currentPts, coords];
+      pointsRef.current = newPts;
+      setPoints(newPts);
+      if (newPts.length >= 3) {
+        const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
+        const vol = computeSoilExcavationVolume(res.areaM2, excavationDepthM, newPts.length);
+        setSoilVolumeResult(vol);
+        if (onDepthCalculated) {
+          onDepthCalculated(excavationDepthM, excavationDepthM, vol.volumeM3, res.areaM2, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+        }
+      }
+      return;
+    }
+
+    // RULE 6: Spatial Mode - Horizontal Area (ARPlane.Type.HORIZONTAL_UPWARD_FACING, Delta Y = 0)
+    if (drawTool === 'RECTANGLE') {
+      // Smart Rectangle: 2 corner taps
+      if (currentPts.length === 0 || currentPts.length >= 4) {
+        // First corner
+        const newPts = [coords];
+        pointsRef.current = newPts;
+        setPoints(newPts);
+      } else {
+        // Second opposite corner: construct 4 orthogonal corners
+        const p1 = currentPts[0];
+        const p2 = { x: coords.x, y: p1.y };
+        const p3 = coords;
+        const p4 = { x: p1.x, y: coords.y };
+        const rectPts = [p1, p2, p3, p4];
+        pointsRef.current = rectPts;
+        setPoints(rectPts);
+        const res = computePrecisionPolygonArea(rectPts, canvasRef.current.width, canvasRef.current.height);
+        setSpatialAnchors(res.anchors);
+        if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+      }
+    } else if (drawTool === 'TAPE') {
+      // Linear Tape Measure (2 points)
+      if (currentPts.length === 0 || currentPts.length >= 2) {
+        const newPts = [coords];
+        pointsRef.current = newPts;
+        setPoints(newPts);
+      } else {
+        const newPts = [currentPts[0], coords];
+        pointsRef.current = newPts;
+        setPoints(newPts);
+        const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
+        setSpatialAnchors(res.anchors);
+        if (onAreaCalculated) onAreaCalculated(0, res.perimeterM);
+      }
+    } else if (drawTool === 'CIRCLE') {
+      // Circular Bed: Center point + Radius point
+      if (currentPts.length === 0 || currentPts.length > 2) {
+        const newPts = [coords];
+        pointsRef.current = newPts;
+        setPoints(newPts);
+      } else {
+        const center = currentPts[0];
+        const radiusPx = Math.hypot(coords.x - center.x, coords.y - center.y);
+        const circlePts: Point2D[] = [];
+        const segments = 16;
+        for (let s = 0; s < segments; s++) {
+          const ang = (s * 2 * Math.PI) / segments;
+          circlePts.push({
+            x: center.x + radiusPx * Math.cos(ang),
+            y: center.y + radiusPx * Math.sin(ang),
+          });
+        }
+        pointsRef.current = circlePts;
+        setPoints(circlePts);
+        const res = computePrecisionPolygonArea(circlePts, canvasRef.current.width, canvasRef.current.height);
+        setSpatialAnchors(res.anchors);
+        if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+      }
+    } else if (drawTool === 'FREEHAND') {
       const newPts = [...pointsRef.current, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
       const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
       setSpatialAnchors(res.anchors);
-      if (onAreaCalculated) onAreaCalculated(res.areaM2);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
     } else {
+      // TAP_POINTS (Default high-precision corner vertex tapping)
+      // Check if tapping close to first vertex to close polygon
+      if (currentPts.length >= 3) {
+        const firstPt = currentPts[0];
+        const distToFirst = Math.hypot(coords.x - firstPt.x, coords.y - firstPt.y);
+        if (distToFirst < 25) {
+          // Close and finish
+          const res = computePrecisionPolygonArea(currentPts, canvasRef.current.width, canvasRef.current.height);
+          setSpatialAnchors(res.anchors);
+          if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+          return;
+        }
+      }
+
       if (currentPts.length > 0) {
         const lastPt = currentPts[currentPts.length - 1];
         const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
-        if (dist < 12) return;
+        if (dist < 10) return;
       }
       const newPts = [...currentPts, coords];
       pointsRef.current = newPts;
       setPoints(newPts);
       const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
       setSpatialAnchors(res.anchors);
-      if (onAreaCalculated) onAreaCalculated(res.areaM2);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
     }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (mode !== 'SURFACE' || !isDragging || !canvasRef.current) return;
+    if (!isDragging || !canvasRef.current) return;
     if (e.cancelable) e.preventDefault();
 
     const coords = getCanvasCoords(e);
@@ -554,7 +779,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       const res = computePrecisionPolygonArea(currentPts, canvasRef.current.width, canvasRef.current.height);
       setSpatialAnchors(res.anchors);
-      if (onAreaCalculated) onAreaCalculated(res.areaM2);
+      if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
       return;
     }
 
@@ -564,7 +789,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     if (currentPts.length > 0) {
       const lastPt = currentPts[currentPts.length - 1];
       const dist = Math.hypot(coords.x - lastPt.x, coords.y - lastPt.y);
-      if (dist < 8) return;
+      if (dist < 10) return;
     }
 
     const newPts = [...currentPts, coords];
@@ -572,7 +797,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
     const res = computePrecisionPolygonArea(newPts, canvasRef.current.width, canvasRef.current.height);
     setSpatialAnchors(res.anchors);
-    if (onAreaCalculated) onAreaCalculated(res.areaM2);
+    if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -586,7 +811,28 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
       setIsDragging(false);
       setDraggedVertexIndex(null);
       setMagnifierPos(null);
-      setPoints([...pointsRef.current]);
+
+      // Simplify freehand points if needed
+      if (drawTool === 'FREEHAND' && pointsRef.current.length > 20) {
+        const raw = pointsRef.current;
+        const step = Math.ceil(raw.length / 16);
+        const simplified: Point2D[] = [];
+        for (let i = 0; i < raw.length; i += step) {
+          simplified.push(raw[i]);
+        }
+        if (raw.length > 0 && simplified[simplified.length - 1] !== raw[raw.length - 1]) {
+          simplified.push(raw[raw.length - 1]);
+        }
+        pointsRef.current = simplified;
+        setPoints(simplified);
+        if (canvasRef.current) {
+          const res = computePrecisionPolygonArea(simplified, canvasRef.current.width, canvasRef.current.height);
+          setSpatialAnchors(res.anchors);
+          if (onAreaCalculated) onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
+        }
+      } else {
+        setPoints([...pointsRef.current]);
+      }
     }
   };
 
@@ -604,21 +850,34 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
     const res = computePrecisionPolygonArea(presetPts, w, h);
     setSpatialAnchors(res.anchors);
     if (onAreaCalculated) {
-      onAreaCalculated(res.areaM2);
+      onAreaCalculated(res.areaM2, res.perimeterM, res.boundingBoxM?.widthM, res.boundingBoxM?.lengthM);
     }
   };
 
   const handleScanHole = () => {
-    const randomMax = Math.round((0.35 + Math.random() * 0.45) * 100) / 100;
-    const randomAvg = Math.round((randomMax * 0.65) * 100) / 100;
-    setSimulatedMaxDepth(randomMax);
-    setSimulatedAvgDepth(randomAvg);
+    const currentPts = pointsRef.current;
+    let holeArea = 3.0;
+    let widthM = 2.0;
+    let lengthM = 1.5;
 
-    const holeArea = 2.5;
-    const backfillVol = Math.round((holeArea * randomAvg) * 1000) / 1000;
+    if (currentPts.length >= 3 && canvasRef.current) {
+      const res = computePrecisionPolygonArea(currentPts, canvasRef.current.width, canvasRef.current.height);
+      if (res.areaM2 > 0) {
+        holeArea = res.areaM2;
+        widthM = res.boundingBoxM?.widthM || Math.round(Math.sqrt(holeArea) * 100) / 100;
+        lengthM = res.boundingBoxM?.lengthM || Math.round(Math.sqrt(holeArea) * 100) / 100;
+      }
+    }
 
+    const measuredMax = Math.round(simulatedMaxDepth * 100) / 100;
+    const measuredAvg = Math.round(simulatedAvgDepth * 100) / 100;
+    const backfillVol = Math.round((holeArea * measuredAvg) * 1000) / 1000;
+
+    if (onAreaCalculated) {
+      onAreaCalculated(holeArea, undefined, widthM, lengthM);
+    }
     if (onDepthCalculated) {
-      onDepthCalculated(randomMax, randomAvg, backfillVol);
+      onDepthCalculated(measuredMax, measuredAvg, backfillVol, holeArea, widthM, lengthM);
     }
   };
 
@@ -752,11 +1011,246 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
         }
       }
 
-      // Render Mode Overlays based on Pre-Capture Mode Selection
-      const shouldDrawArea = preCaptureMode === 'REAL_AREA' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'SURFACE';
-      const shouldDrawDepth = preCaptureMode === 'REAL_DEPTH' || preCaptureMode === 'REAL_AREA_AND_DEPTH' || mode === 'HOLE_DEPTH';
+      // RULE 6: Spatial Mode Overlay Rendering
+      if (spatialMode === 'VERTICAL_HEIGHT') {
+        // Vertical Wall Plane Grid (ARPlane.Type.VERTICAL)
+        ctx.save();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.25)';
+        ctx.lineWidth = 1;
+        for (let vx = 40; vx < canvas.width; vx += 50) {
+          ctx.beginPath();
+          ctx.moveTo(vx, 0);
+          ctx.lineTo(vx, canvas.height);
+          ctx.stroke();
+        }
+        for (let vy = 40; vy < canvas.height; vy += 50) {
+          ctx.beginPath();
+          ctx.moveTo(0, vy);
+          ctx.lineTo(canvas.width, vy);
+          ctx.stroke();
+        }
+        ctx.restore();
 
-      if (shouldDrawArea) {
+        const pts = pointsRef.current;
+        if (pts.length >= 1) {
+          // Top Point Anchor
+          const pTop = pts[0];
+          ctx.beginPath();
+          ctx.arc(pTop.x, pTop.y, 14, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.3)';
+          ctx.fill();
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(pTop.x, pTop.y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = '#38bdf8';
+          ctx.fill();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.fillText('القمة (Y_top)', pTop.x + 16, pTop.y + 4);
+
+          // If only 1 point, draw plumb line following cursor/downwards
+          if (pts.length === 1) {
+            ctx.setLineDash([4, 4]);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(pTop.x, pTop.y);
+            ctx.lineTo(pTop.x, canvas.height - 40);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        }
+
+        if (pts.length >= 2) {
+          const pTop = pts[0];
+          const pBottom = pts[1];
+
+          // Bottom Point Anchor
+          ctx.beginPath();
+          ctx.arc(pBottom.x, pBottom.y, 14, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(244, 63, 94, 0.3)';
+          ctx.fill();
+          ctx.strokeStyle = '#f43f5e';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(pBottom.x, pBottom.y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = '#f43f5e';
+          ctx.fill();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 11px sans-serif';
+          ctx.fillText('القاعدة (Y_bottom)', pBottom.x + 16, pBottom.y + 4);
+
+          // Direct line between points
+          ctx.beginPath();
+          ctx.moveTo(pTop.x, pTop.y);
+          ctx.lineTo(pBottom.x, pBottom.y);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Vertical Plumb Line strictly along gravity vector (Y-axis)
+          ctx.beginPath();
+          ctx.moveTo(pTop.x, pTop.y);
+          ctx.lineTo(pTop.x, pBottom.y);
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+
+          // Horizontal alignment leg (X-offset)
+          ctx.beginPath();
+          ctx.moveTo(pTop.x, pBottom.y);
+          ctx.lineTo(pBottom.x, pBottom.y);
+          ctx.strokeStyle = 'rgba(251, 191, 36, 0.8)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 3]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Height Badge
+          const frameCtx = cachedSpatialFrame || getActiveSpatialFrameContext(canvas.width, canvas.height);
+          const vHeight = computeVerticalHeight(
+            pTop,
+            pBottom,
+            frameCtx,
+            canvas.width,
+            canvas.height,
+            wallDistanceM,
+            effectiveRollRad
+          );
+
+          const midY = (pTop.y + pBottom.y) / 2;
+          const badgeX = Math.max(160, Math.min(canvas.width - 160, pTop.x - 20));
+
+          ctx.save();
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2;
+          const boxW = 270;
+          const boxH = 58;
+          ctx.beginPath();
+          ctx.roundRect(badgeX - boxW / 2, midY - boxH / 2, boxW, boxH, 10);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#38bdf8';
+          ctx.font = 'bold 13px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(`الارتفاع الرأسي الحقيقي: ${vHeight.heightM.toFixed(2)} م`, badgeX, midY - 14);
+
+          ctx.fillStyle = '#a5f3fc';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.fillText(`H = |Y_top - Y_bottom| على متجه الجاذبية`, badgeX, midY + 1);
+
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '9px sans-serif';
+          ctx.fillText(`المسافة الأفقية: ${vHeight.horizontalOffsetM.toFixed(2)}م | الوترية: ${vHeight.straightDistanceM.toFixed(2)}م | جدار: ${wallDistanceM.toFixed(1)}م`, badgeX, midY + 16);
+          ctx.restore();
+        }
+      } else if (spatialMode === 'EXCAVATION_DEPTH_VOLUME') {
+        // Soil Excavation Depth & Volume Mode (V = Area * Depth)
+        const pts = pointsRef.current;
+        if (pts.length >= 3) {
+          // 3D Surface Area Polygon
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+          }
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(217, 119, 6, 0.35)'; // Earthy amber
+          ctx.fill();
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+
+          // 3D Depth Extrusion Lines (Soil Excavation Pit)
+          const depthPxOffset = Math.min(80, Math.max(20, excavationDepthM * 120));
+          ctx.save();
+          ctx.strokeStyle = 'rgba(245, 158, 11, 0.6)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 4]);
+
+          // Extrusion bottom polygon
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y + depthPxOffset);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y + depthPxOffset);
+          }
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(120, 53, 15, 0.4)';
+          ctx.fill();
+          ctx.stroke();
+
+          // Vertical edge lines connecting surface to bottom
+          for (let i = 0; i < pts.length; i++) {
+            ctx.beginPath();
+            ctx.moveTo(pts[i].x, pts[i].y);
+            ctx.lineTo(pts[i].x, pts[i].y + depthPxOffset);
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          // Centroid Volume Display Badge
+          let sumX = 0, sumY = 0;
+          pts.forEach((p) => {
+            sumX += p.x;
+            sumY += p.y;
+          });
+          const centroidX = sumX / pts.length;
+          const centroidY = sumY / pts.length;
+
+          const precisionCalc = computePrecisionPolygonArea(pts, canvas.width, canvas.height);
+          const vol = computeSoilExcavationVolume(precisionCalc.areaM2, excavationDepthM, pts.length);
+
+          ctx.save();
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 2;
+          const boxW = 310;
+          const boxH = 68;
+          ctx.beginPath();
+          ctx.roundRect(centroidX - boxW / 2, centroidY - boxH / 2, boxW, boxH, 12);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#fbbf24';
+          ctx.font = 'bold 13px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(`حجم التربة والردم: ${vol.volumeM3.toFixed(3)} م³ (${vol.volumeLiters} لتر)`, centroidX, centroidY - 18);
+
+          ctx.fillStyle = '#fde68a';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.fillText(`V = المساحة (${vol.surfaceAreaM2.toFixed(2)}م²) × العمق (${vol.measuredDepthM.toFixed(2)}م)`, centroidX, centroidY - 1);
+
+          ctx.fillStyle = '#6ee7b7';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.fillText(`📦 أكياس التربة (50L): ${vol.estimatedSoilBags50L} كيس | 🚚 شاحنات: ${vol.estimatedTruckloadsM3} شاحنة`, centroidX, centroidY + 16);
+          ctx.restore();
+        }
+
+        // Draw Vertices
+        pts.forEach((pt, index) => {
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 8, 0, Math.PI * 2);
+          ctx.fillStyle = '#f59e0b';
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.fillText(`${index + 1}`, pt.x - 3, pt.y + 3);
+        });
+      } else {
+        // RULE 6: Spatial Mode - Horizontal Area (ARPlane.Type.HORIZONTAL_UPWARD_FACING, Delta Y = 0)
         const pts = pointsRef.current;
         if (pts.length > 0) {
           if (pts.length >= 3) {
@@ -785,65 +1279,105 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
             const precisionCalc = computePrecisionPolygonArea(pts, canvas.width, canvas.height);
             const areaFormatted = formatAreaArabicDetailed(precisionCalc.areaM2);
+            const fused = precisionCalc.fusedResult;
 
             ctx.save();
             ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
             ctx.strokeStyle = '#34d399';
             ctx.lineWidth = 1.5;
 
-            const boxW = 230;
-            const boxH = 46;
+            const boxW = 280;
+            const boxH = 56;
             ctx.beginPath();
             ctx.roundRect(centroidX - boxW / 2, centroidY - boxH / 2, boxW, boxH, 10);
             ctx.fill();
             ctx.stroke();
 
             ctx.fillStyle = '#34d399';
-            ctx.font = 'bold 12px sans-serif';
+            ctx.font = 'bold 13px sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText(`المساحة المعايرة: ${areaFormatted.primary}`, centroidX, centroidY - 8);
+            ctx.fillText(`المساحة المعايرة الحقيقية: ${areaFormatted.primary}`, centroidX, centroidY - 14);
+
             ctx.fillStyle = '#a7f3d0';
             ctx.font = 'bold 10px sans-serif';
-            ctx.fillText(`(${areaFormatted.detailed})`, centroidX, centroidY + 7);
-            ctx.fillStyle = '#6ee7b7';
+            const fusionDetails = fused 
+              ? `Shoelace: ${fused.areaShoelace3DM2}م² | Homography: ${fused.areaHomographyBirdEyeM2}م²`
+              : `(${areaFormatted.detailed})`;
+            ctx.fillText(fusionDetails, centroidX, centroidY + 1);
+
+            ctx.fillStyle = '#38bdf8';
             ctx.font = '9px sans-serif';
-            ctx.fillText(`محيط: ${precisionCalc.perimeterM}م | معامل الدقة: ${calibrationSettings.scaleFactor.toFixed(3)}x`, centroidX, centroidY + 18);
+            const discText = fused 
+              ? `تطابق المنظومتين: ${(100 - (fused.strategyDiscrepancyPercent || 0)).toFixed(1)}% | محيط: ${precisionCalc.perimeterM}م`
+              : `محيط: ${precisionCalc.perimeterM}م | معامل الدقة: ${calibrationSettings.scaleFactor.toFixed(3)}x`;
+            ctx.fillText(discText, centroidX, centroidY + 16);
             ctx.restore();
           }
 
           // Draw Edges & Real 3D Unprojected Distances with Centimeter Precision
           ctx.font = 'bold 11px sans-serif';
           ctx.textAlign = 'center';
-          for (let i = 0; i < pts.length; i++) {
+          const maxSegments = pts.length >= 3 ? pts.length : (pts.length === 2 ? 1 : 0);
+          for (let i = 0; i < maxSegments; i++) {
             const nextIdx = (i + 1) % pts.length;
-            if (pts.length >= 2) {
-              const p1 = pts[i];
-              const p2 = pts[nextIdx];
-              ctx.beginPath();
-              ctx.moveTo(p1.x, p1.y);
-              ctx.lineTo(p2.x, p2.y);
-              ctx.strokeStyle = '#34d399';
-              ctx.lineWidth = 2.5;
-              ctx.stroke();
+            const p1 = pts[i];
+            const p2 = pts[nextIdx];
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.strokeStyle = '#34d399';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
 
-              // Calculate 3D Real Distance in Meters
-              const p1_3D = unprojectScreenTo3DPlane(p1.x, p1.y, canvas.width, canvas.height);
-              const p2_3D = unprojectScreenTo3DPlane(p2.x, p2.y, canvas.width, canvas.height);
-              const rawDist = distance3D(p1_3D, p2_3D) * calibrationSettings.scaleFactor;
-              const distText = formatDistanceArabic(rawDist);
+            // Calculate 3D Real Distance in Meters
+            const p1_3D = unprojectScreenTo3DPlane(p1.x, p1.y, canvas.width, canvas.height);
+            const p2_3D = unprojectScreenTo3DPlane(p2.x, p2.y, canvas.width, canvas.height);
+            const rawDist = distance3D(p1_3D, p2_3D) * calibrationSettings.scaleFactor;
+            const distText = formatDistanceArabic(rawDist);
 
-              const midX = (p1.x + p2.x) / 2;
-              const midY = (p1.y + p2.y) / 2;
-              ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
-              ctx.fillRect(midX - 38, midY - 12, 76, 22);
-              ctx.fillStyle = '#34d399';
-              ctx.fillText(distText, midX, midY + 3);
-            }
+            const midX = (p1.x + p2.x) / 2;
+            const midY = (p1.y + p2.y) / 2;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+            ctx.fillRect(midX - 38, midY - 12, 76, 22);
+            ctx.fillStyle = '#34d399';
+            ctx.fillText(distText, midX, midY + 3);
+          }
+
+          // If exactly 2 points (Tape mode / Distance check), show distance badge at center
+          if (pts.length === 2) {
+            const p1_3D = unprojectScreenTo3DPlane(pts[0].x, pts[0].y, canvas.width, canvas.height);
+            const p2_3D = unprojectScreenTo3DPlane(pts[1].x, pts[1].y, canvas.width, canvas.height);
+            const lineDist = distance3D(p1_3D, p2_3D) * calibrationSettings.scaleFactor;
+            const midX = (pts[0].x + pts[1].x) / 2;
+            const midY = (pts[0].y + pts[1].y) / 2;
+
+            ctx.save();
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.5;
+            const boxW = 180;
+            const boxH = 34;
+            ctx.beginPath();
+            ctx.roundRect(midX - boxW / 2, midY - 45, boxW, boxH, 8);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.fillText(`المسافة الخطية: ${lineDist.toFixed(2)} م`, midX, midY - 28);
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '9px sans-serif';
+            ctx.fillText(`(${Math.round(lineDist * 100)} سم) بين النقطتين`, midX, midY - 16);
+            ctx.restore();
           }
 
           // Draw Points Vertices & 3D Spatial Anchor Rings
+          const precisionCalcForVertices = pts.length >= 3 ? computePrecisionPolygonArea(pts, canvas.width, canvas.height) : null;
+          const fusedData = precisionCalcForVertices?.fusedResult;
+
           pts.forEach((pt, index) => {
             const isDragged = draggedVertexIndex === index;
+            const vDepth = fusedData?.vertexDepthsM?.[index];
 
             // Outer Anchor Halo
             ctx.beginPath();
@@ -864,6 +1398,26 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.fillStyle = '#ffffff';
             ctx.font = 'bold 10px sans-serif';
             ctx.fillText(`${index + 1}`, pt.x - 3, pt.y + 3);
+
+            // Display per-vertex metric slant depth badge
+            if (vDepth !== undefined) {
+              ctx.save();
+              ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+              ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+              ctx.lineWidth = 1;
+              const depthW = 46;
+              const depthH = 16;
+              ctx.beginPath();
+              ctx.roundRect(pt.x - depthW / 2, pt.y - 28, depthW, depthH, 4);
+              ctx.fill();
+              ctx.stroke();
+
+              ctx.fillStyle = '#38bdf8';
+              ctx.font = 'bold 9px sans-serif';
+              ctx.textAlign = 'center';
+              ctx.fillText(`${vDepth.toFixed(2)}م`, pt.x, pt.y - 16);
+              ctx.restore();
+            }
           });
 
           // Magnifier Loupe when dragging vertex
@@ -909,61 +1463,6 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             ctx.stroke();
           }
         }
-      }
-
-      if (shouldDrawDepth) {
-        const centerX = canvas.width / 2;
-        const centerY = canvas.height / 2 + (shouldDrawArea ? 40 : 10);
-
-        if (showDepthHeatmap) {
-          const radiusMax = 100;
-          const rings = 4;
-
-          for (let r = rings; r >= 1; r--) {
-            const currentRadius = (radiusMax / rings) * r;
-            ctx.beginPath();
-            ctx.ellipse(centerX, centerY, currentRadius * 1.4, currentRadius * 0.8, 0, 0, Math.PI * 2);
-            
-            if (r === 1) ctx.fillStyle = 'rgba(239, 68, 68, 0.7)';
-            else if (r === 2) ctx.fillStyle = 'rgba(249, 115, 22, 0.55)';
-            else if (r === 3) ctx.fillStyle = 'rgba(234, 179, 8, 0.45)';
-            else ctx.fillStyle = 'rgba(59, 130, 246, 0.25)';
-
-            ctx.fill();
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
-
-          ctx.strokeStyle = '#ef4444';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(centerX, centerY, 12, 0, Math.PI * 2);
-          ctx.stroke();
-
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-          ctx.fillRect(centerX - 100, centerY - 50, 200, 36);
-          ctx.strokeStyle = '#f59e0b';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(centerX - 100, centerY - 50, 200, 36);
-
-          ctx.fillStyle = '#fbbf24';
-          ctx.font = 'bold 11px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(`مسافة العدسة للسطح: ${calibrationSettings.cameraHeightM.toFixed(2)}م`, centerX, centerY - 35);
-          ctx.fillStyle = '#f87171';
-          ctx.font = 'bold 10px sans-serif';
-          ctx.fillText(`عمق الحفرة الفيزيائي: -${simulatedMaxDepth} م`, centerX, centerY - 20);
-        }
-
-        ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(centerX - 35, centerY);
-        ctx.lineTo(centerX + 35, centerY);
-        ctx.moveTo(centerX, centerY - 35);
-        ctx.lineTo(centerX, centerY + 35);
-        ctx.stroke();
       }
 
       animationFrameId = requestAnimationFrame(render);
@@ -1095,37 +1594,157 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
 
       {/* Top Precision Calibration HUD Bar */}
       {!isFullScreenMode && (
-        <div className="absolute top-3 right-3 left-3 z-30 flex flex-wrap items-center justify-between gap-2 p-2 px-3 bg-slate-900/90 border border-slate-700/80 rounded-2xl text-white text-xs backdrop-blur-md shadow-xl">
-          <div className="flex items-center gap-2 overflow-hidden">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
-            <span className="font-bold text-emerald-300 whitespace-nowrap">المنظومة:</span>
-            <span className="font-extrabold text-white truncate flex items-center gap-1.5">
-              <span>{calibrationSettings.scaleFactor === 1.0 ? 'معايرة قياسية (1.00x)' : `معايرة مخصصة (${calibrationSettings.scaleFactor.toFixed(3)}x)`}</span>
-              <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">| ارتفاع: {calibrationSettings.cameraHeightM.toFixed(2)}م</span>
-              <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline">| زاوية: {sensorOrientation.pitchDeg.toFixed(0)}°</span>
-            </span>
+        <div className="absolute top-3 right-3 left-3 z-30 flex flex-col gap-2">
+          {/* Main Top Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 p-2 px-3 bg-slate-900/90 border border-slate-700/80 rounded-2xl text-white text-xs backdrop-blur-md shadow-xl">
+            <div className="flex items-center gap-2 overflow-hidden">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+              <span className="font-bold text-emerald-300 whitespace-nowrap">المنظومة:</span>
+              <span className="font-extrabold text-white truncate flex items-center gap-1.5">
+                <span>{calibrationSettings.scaleFactor === 1.0 ? 'معايرة قياسية (1.00x)' : `معايرة مخصصة (${calibrationSettings.scaleFactor.toFixed(3)}x)`}</span>
+                <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">| ارتفاع: {calibrationSettings.cameraHeightM.toFixed(2)}م</span>
+                <span className="text-[10px] text-emerald-400 font-mono hidden sm:inline">| زاوية: {sensorOrientation.pitchDeg.toFixed(0)}°</span>
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Open Calibration Suite */}
+              <button
+                onClick={() => setIsCalibrationModalOpen(true)}
+                className="px-2.5 py-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition-all shadow-xs cursor-pointer border border-emerald-400/30"
+                title="فتح منظومة المعايرة والضبط المكاني"
+              >
+                <Sliders className="w-3.5 h-3.5" />
+                <span>معايرة القياس ⚙️</span>
+              </button>
+
+              {onOpenModeSelection && (
+                <button
+                  onClick={onOpenModeSelection}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-medium text-xs flex items-center gap-1 transition-all border border-slate-700 cursor-pointer"
+                >
+                  <span>الوضع 🔄</span>
+                </button>
+              )}
+            </div>
           </div>
 
-          <div className="flex items-center gap-2 flex-shrink-0">
-            {/* Open Calibration Suite */}
-            <button
-              onClick={() => setIsCalibrationModalOpen(true)}
-              className="px-2.5 py-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 transition-all shadow-xs cursor-pointer border border-emerald-400/30"
-              title="فتح منظومة المعايرة والضبط المكاني"
-            >
-              <Sliders className="w-3.5 h-3.5" />
-              <span>معايرة القياس ⚙️</span>
-            </button>
-
-            {onOpenModeSelection && (
+          {/* RULE 6: Multi-Mode Spatial Engine Selector Bar */}
+          <div className="flex items-center justify-between gap-1.5 p-1.5 px-2 bg-slate-950/85 border border-slate-800/80 rounded-2xl text-xs backdrop-blur-md shadow-lg overflow-x-auto">
+            <div className="flex items-center gap-1">
               <button
-                onClick={onOpenModeSelection}
-                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-medium text-xs flex items-center gap-1 transition-all border border-slate-700 cursor-pointer"
+                onClick={() => {
+                  setSpatialMode('HORIZONTAL_AREA');
+                  setPoints([]);
+                  setVerticalHeightResult(null);
+                  setSoilVolumeResult(null);
+                }}
+                className={`px-3 py-1 rounded-xl font-bold text-[11px] sm:text-xs flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                  spatialMode === 'HORIZONTAL_AREA'
+                    ? 'bg-emerald-600 text-white shadow-md ring-1 ring-emerald-400/40'
+                    : 'text-slate-400 hover:text-slate-200 bg-slate-900/50'
+                }`}
+                title="قياس المساحة الأفقية للحديقة أو الثيل (ARPlane.Type.HORIZONTAL_UPWARD_FACING, ΔY = 0)"
               >
-                <span>الوضع 🔄</span>
+                <Layers className="w-3.5 h-3.5" />
+                <span>المساحة الأفقية (م²)</span>
               </button>
+
+              <button
+                onClick={() => {
+                  setSpatialMode('VERTICAL_HEIGHT');
+                  setPoints([]);
+                  setVerticalHeightResult(null);
+                  setSoilVolumeResult(null);
+                }}
+                className={`px-3 py-1 rounded-xl font-bold text-[11px] sm:text-xs flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                  spatialMode === 'VERTICAL_HEIGHT'
+                    ? 'bg-sky-600 text-white shadow-md ring-1 ring-sky-400/40'
+                    : 'text-slate-400 hover:text-slate-200 bg-slate-900/50'
+                }`}
+                title="قياس الارتفاع الرأسي والجداري (ARPlane.Type.VERTICAL, H = |Y_top - Y_bottom|)"
+              >
+                <ArrowDownUp className="w-3.5 h-3.5" />
+                <span>الارتفاع الرأسي (م)</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setSpatialMode('EXCAVATION_DEPTH_VOLUME');
+                  setPoints([]);
+                  setVerticalHeightResult(null);
+                  setSoilVolumeResult(null);
+                }}
+                className={`px-3 py-1 rounded-xl font-bold text-[11px] sm:text-xs flex items-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                  spatialMode === 'EXCAVATION_DEPTH_VOLUME'
+                    ? 'bg-amber-600 text-white shadow-md ring-1 ring-amber-400/40'
+                    : 'text-slate-400 hover:text-slate-200 bg-slate-900/50'
+                }`}
+                title="قياس عمق الحفر وحجم التربة والردم (V = Area × Depth)"
+              >
+                <Box className="w-3.5 h-3.5" />
+                <span>عمق الحفر والتربة (م³)</span>
+              </button>
+            </div>
+
+            {/* Contextual Mode Parameter Sliders */}
+            {spatialMode === 'EXCAVATION_DEPTH_VOLUME' && (
+              <div className="flex items-center gap-2 px-2 py-0.5 bg-slate-900 rounded-lg text-[10px] text-amber-300 font-mono flex-shrink-0">
+                <span>العمق:</span>
+                <button
+                  onClick={() => setExcavationDepthM((d) => Math.max(0.05, Math.round((d - 0.05) * 100) / 100))}
+                  className="px-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded font-bold"
+                >
+                  -
+                </button>
+                <span className="font-bold">{excavationDepthM.toFixed(2)}م</span>
+                <button
+                  onClick={() => setExcavationDepthM((d) => Math.min(3.0, Math.round((d + 0.05) * 100) / 100))}
+                  className="px-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded font-bold"
+                >
+                  +
+                </button>
+              </div>
+            )}
+
+            {spatialMode === 'VERTICAL_HEIGHT' && (
+              <div className="flex items-center gap-2 px-2 py-0.5 bg-slate-900 rounded-lg text-[10px] text-sky-300 font-mono flex-shrink-0">
+                <span>بعد الجدار:</span>
+                <button
+                  onClick={() => setWallDistanceM((w) => Math.max(0.5, Math.round((w - 0.5) * 10) / 10))}
+                  className="px-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded font-bold"
+                >
+                  -
+                </button>
+                <span className="font-bold">{wallDistanceM.toFixed(1)}م</span>
+                <button
+                  onClick={() => setWallDistanceM((w) => Math.min(10.0, Math.round((w + 0.5) * 10) / 10))}
+                  className="px-1.5 bg-slate-800 hover:bg-slate-700 text-white rounded font-bold"
+                >
+                  +
+                </button>
+              </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Environmental Guardrails & Motion Drift Indicator (Rule E) */}
+      {(isHighVelocity || guardWarningMessage) && (
+        <div className="absolute top-14 left-4 right-4 z-40 bg-amber-950/95 border-2 border-amber-500 text-amber-200 px-4 py-2.5 rounded-xl shadow-2xl flex items-center justify-between gap-3 animate-bounce">
+          <div className="flex items-center gap-2 text-xs sm:text-sm font-bold">
+            <AlertCircle className="w-5 h-5 text-amber-400 animate-pulse flex-shrink-0" />
+            <span>{guardWarningMessage || 'أبطئ حركة الجهاز (Slow Down Device) لتفادي انحراف التتبع'}</span>
+          </div>
+          <button
+            onClick={() => {
+              setIsHighVelocity(false);
+              setGuardWarningMessage(null);
+            }}
+            className="text-xs bg-amber-900 hover:bg-amber-800 text-amber-300 px-2 py-1 rounded-lg border border-amber-600/50"
+          >
+            حسناً ✕
+          </button>
         </div>
       )}
 
@@ -1206,30 +1825,80 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             )}
 
             {mode === 'SURFACE' && (
-              <div className="flex items-center p-0.5 bg-slate-950/80 border border-slate-700/80 rounded-xl">
-                <button
-                  id="tool-freehand-btn"
-                  onClick={() => setDrawTool('FREEHAND')}
-                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
-                    drawTool === 'FREEHAND'
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  <Pencil className="w-3 h-3" />
-                  رسم حر
-                </button>
+              <div className="flex items-center p-0.5 bg-slate-950/80 border border-slate-700/80 rounded-xl overflow-x-auto max-w-full">
                 <button
                   id="tool-tappoints-btn"
                   onClick={() => setDrawTool('TAP_POINTS')}
-                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all ${
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer ${
                     drawTool === 'TAP_POINTS'
                       ? 'bg-emerald-600 text-white shadow-xs'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
+                  title="تحديد زوايا وأركان المضلع بدقة عالية"
                 >
                   <MousePointer className="w-3 h-3" />
-                  تحديد زوايا
+                  أركان وزوايا
+                </button>
+                <button
+                  id="tool-rectangle-btn"
+                  onClick={() => {
+                    setDrawTool('RECTANGLE');
+                    setPoints([]);
+                  }}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer ${
+                    drawTool === 'RECTANGLE'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="مستطيل ذكي بنقرتين متعاكستين"
+                >
+                  <Square className="w-3 h-3" />
+                  مستطيل
+                </button>
+                <button
+                  id="tool-tape-btn"
+                  onClick={() => {
+                    setDrawTool('TAPE');
+                    setPoints([]);
+                  }}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer ${
+                    drawTool === 'TAPE'
+                      ? 'bg-sky-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="شريط قياس مسافة خطية مستقيمة بين نقطتين"
+                >
+                  <Ruler className="w-3 h-3" />
+                  مسافة خطية
+                </button>
+                <button
+                  id="tool-circle-btn"
+                  onClick={() => {
+                    setDrawTool('CIRCLE');
+                    setPoints([]);
+                  }}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer ${
+                    drawTool === 'CIRCLE'
+                      ? 'bg-teal-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="حوض دائري (نقطة المركز ونصف القطر)"
+                >
+                  <Circle className="w-3 h-3" />
+                  حوض دائري
+                </button>
+                <button
+                  id="tool-freehand-btn"
+                  onClick={() => setDrawTool('FREEHAND')}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer ${
+                    drawTool === 'FREEHAND'
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="رسم مسار حر متواصل"
+                >
+                  <Pencil className="w-3 h-3" />
+                  رسم حر
                 </button>
               </div>
             )}
@@ -1238,7 +1907,7 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
               <button
                 id="preset-surface-btn"
                 onClick={handleAutoPresetSurface}
-                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 rounded-xl font-medium flex items-center gap-1 transition-all text-[11px]"
+                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 rounded-xl font-medium flex items-center gap-1 transition-all text-[11px] whitespace-nowrap cursor-pointer"
               >
                 <Focus className="w-3.5 h-3.5" />
                 شكل افتراضي
@@ -1246,14 +1915,42 @@ export const ARCameraView: React.FC<ARCameraViewProps> = ({
             )}
 
             {mode === 'HOLE_DEPTH' && (
-              <button
-                id="scan-hole-btn"
-                onClick={handleScanHole}
-                className="px-3 py-1.5 bg-amber-600 text-white hover:bg-amber-500 rounded-xl font-medium flex items-center gap-1.5 transition-all shadow-xs"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                مسح AR Depth
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  id="scan-hole-btn"
+                  onClick={handleScanHole}
+                  className="px-3 py-1.5 bg-amber-600 text-white hover:bg-amber-500 rounded-xl font-medium flex items-center gap-1.5 transition-all shadow-xs cursor-pointer whitespace-nowrap"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  مسح AR Depth وحساب الردم
+                </button>
+
+                {/* Depth Quick Tweak */}
+                <div className="flex items-center gap-1 bg-slate-950/80 px-2 py-1 rounded-xl border border-slate-700 text-[11px]">
+                  <span className="text-slate-400">العمق:</span>
+                  <button
+                    onClick={() => {
+                      const newD = Math.max(0.1, Math.round((simulatedAvgDepth - 0.05) * 100) / 100);
+                      setSimulatedAvgDepth(newD);
+                      setSimulatedMaxDepth(Math.round((newD * 1.3) * 100) / 100);
+                    }}
+                    className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-amber-300 font-bold"
+                  >
+                    -5سم
+                  </button>
+                  <span className="font-bold text-amber-400 font-mono px-1">{(simulatedAvgDepth * 100).toFixed(0)}سم</span>
+                  <button
+                    onClick={() => {
+                      const newD = Math.min(3.0, Math.round((simulatedAvgDepth + 0.05) * 100) / 100);
+                      setSimulatedAvgDepth(newD);
+                      setSimulatedMaxDepth(Math.round((newD * 1.3) * 100) / 100);
+                    }}
+                    className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-amber-300 font-bold"
+                  >
+                    +5سم
+                  </button>
+                </div>
+              </div>
             )}
           </div>
 

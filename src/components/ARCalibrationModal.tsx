@@ -64,8 +64,14 @@ export const ARCalibrationModal: React.FC<ARCalibrationModalProps> = ({
       return;
     }
 
+    // Mathematically exact scale factor update:
+    // If currentMeasuredArea is already scaled by settings.scaleFactor^2,
+    // the raw area is currentMeasuredArea / (settings.scaleFactor^2).
+    // The desired scale factor k_new satisfies: rawArea * k_new^2 = knownRealArea
+    // => k_new = sqrt(knownRealArea / rawArea) = settings.scaleFactor * sqrt(knownRealArea / currentMeasuredArea)
+    const rawMeasuredArea = currentMeasuredAreaM2 / (settings.scaleFactor * settings.scaleFactor);
     const calculatedFactor = computeCalibrationScaleFactor(
-      currentMeasuredAreaM2,
+      rawMeasuredArea,
       selectedRef.realAreaM2
     );
 
@@ -87,9 +93,12 @@ export const ARCalibrationModal: React.FC<ARCalibrationModalProps> = ({
       return;
     }
 
-    // Estimate first edge or perimeter
+    // If currentMeasuredPerimeter is already scaled by settings.scaleFactor:
+    // rawLength = currentMeasuredPerimeter / settings.scaleFactor.
+    // desired k_new = knownRealLength / rawLength = settings.scaleFactor * (knownRealLength / currentMeasuredPerimeter)
+    const rawMeasuredLength = currentMeasuredPerimeterM / settings.scaleFactor;
     const calculatedFactor = computeLinearCalibrationScaleFactor(
-      currentMeasuredPerimeterM,
+      rawMeasuredLength,
       customRealLengthM
     );
 

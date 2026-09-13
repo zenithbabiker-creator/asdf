@@ -571,143 +571,465 @@ fun DepthHoleCalculatorScreen(
     path: 'ArPrecisionAreaEngine.kt',
     name: 'app/src/main/java/com/argarden/soilcalculator/ar/ArPrecisionAreaEngine.kt',
     language: 'kotlin',
-    descriptionAr: 'محرك حساب المساحة الدقيق: إسقاط إحداثيات المثبتات ثلاثية الأبعاد (3D Anchors) على السطح وإجراء خوارزمية Shoelace (صيغة غاوس) لإلغاء ضوضاء العمق والاهتزاز',
+    descriptionAr: 'محرك دمج الاستراتيجيات الأربعة لحساب المساحة الدقيقة (Multi-Strategy Fusion): Raycasting 3D، مصفوفة Homography، معايرة المقياس الديناميكي للعمق لكل رأس، وحلقة التصحيح الذاتي للتطابق التام',
     content: `package com.argarden.soilcalculator.ar
 
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tan
 
 data class Point3D(val x: Double, val y: Double, val z: Double)
+data class Point2D(val x: Double, val y: Double)
 data class Point2DProjected(val u: Double, val v: Double)
 
-data class PrecisionAreaResult(
+data class CameraIntrinsics(
+    val fx: Double,
+    val fy: Double,
+    val cx: Double,
+    val cy: Double
+)
+
+data class CameraSpatialPose(
+    val heightM: Double,
+    val pitchRad: Double,
+    val rollRad: Double = 0.0
+)
+
+data class FusedPrecisionAreaResult(
     val areaM2: Double,
+    val areaShoelace3DM2: Double,
+    val areaHomographyBirdEyeM2: Double,
+    val strategyDiscrepancyPercent: Double,
+    val convergenceIterCount: Int,
+    val optimizedPitchDeg: Double,
     val perimeterM: Double,
-    val edgeDistancesM: List<Double>,
-    val surfaceNormal: Point3D,
-    val centroid: Point3D
+    val edgeLengthsM: List<Double>,
+    val vertexDepthsM: List<Double>,
+    val vertexMetricScaleMPerPx: List<Double>,
+    val homographyMatrix: Array<DoubleArray>,
+    val birdEyeCoordinates: List<Point2D>,
+    val centroid3D: Point3D,
+    val surfaceNormal: Point3D
 )
 
 /**
- * Autonomous Precision Area Engine for ARCore & Huawei AR Engine
- * 1. Extracts 3D coordinates (X, Y, Z) of attached plane Anchors.
- * 2. Projects 3D points onto the local surface plane (u, v) using Newell's plane normal,
- *    eliminating normal-axis depth/height noise.
- * 3. Executes Gauss's Area Formula (Shoelace Formula): Area = 0.5 * |sum(u_i * v_{i+1} - u_{i+1} * v_i)|.
+ * Production-Ready 4-Strategy Multi-Fusion Precision Area Engine
+ *
+ * Strategy 1: Metric World-Space Raycasting & 3D Shoelace Plane Projection
+ * Strategy 2: Planar Homography 3x3 Transformation Matrix & Orthorectified Bird's Eye View
+ * Strategy 3: Dynamic Per-Vertex Depth & Scale-per-Pixel Calibration (Inverse-Square Law)
+ * Strategy 4: Cross-Verification & Self-Correction Engine with Iterative Convergence
  */
 object ArPrecisionAreaEngine {
 
-    fun calculatePrecisionArea(points3D: List<Point3D>): PrecisionAreaResult {
-        if (points3D.size < 3) {
-            return PrecisionAreaResult(0.0, 0.0, emptyList(), Point3D(0.0, 1.0, 0.0), Point3D(0.0, 0.0, 0.0))
+    /**
+     * Strategy 1: Raycasts a 2D screen coordinate to the 3D ground plane (Y = 0)
+     */
+    fun raycastScreenToGround(
+        screenPt: Point2D,
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        pitchOverrideRad: Double? = null
+    ): Point3D {
+        val dx = screenPt.x - intrinsics.cx
+        val dy = screenPt.y - intrinsics.cy
+
+        // Lateral roll compensation
+        var px = dx
+        var py = dy
+        if (abs(pose.rollRad) > 0.001) {
+            val cosR = cos(-pose.rollRad)
+            val sinR = sin(-pose.rollRad)
+            px = dx * cosR - dy * sinR
+            py = dx * sinR + dy * cosR
         }
 
-        // 1. Calculate centroid
-        var sumX = 0.0
-        var sumY = 0.0
-        var sumZ = 0.0
-        points3D.forEach {
-            sumX += it.x
-            sumY += it.y
-            sumZ += it.z
-        }
-        val count = points3D.size.toDouble()
-        val centroid = Point3D(sumX / count, sumY / count, sumZ / count)
+        // Normalized camera coordinates
+        val u = px / intrinsics.fx
+        val v = py / intrinsics.fy
 
-        // 2. Calculate best-fit surface plane normal using Newell's method
-        val normal = computePolygonNormalNewell(points3D)
+        val theta = pitchOverrideRad ?: pose.pitchRad.coerceIn(0.10, 1.50)
+        val sinT = sin(theta)
+        val cosT = cos(theta)
 
-        // 3. Construct orthonormal basis vectors (uAxis, vAxis) on the plane
-        var refVec = Point3D(1.0, 0.0, 0.0)
-        if (abs(dot(normal, refVec)) > 0.9) {
-            refVec = Point3D(0.0, 0.0, 1.0)
-        }
-        val uAxis = normalize(cross(normal, refVec))
-        val vAxis = normalize(cross(normal, uAxis))
+        val denom = (sinT + v * cosT).coerceAtLeast(0.04)
+        val t = pose.heightM.coerceAtLeast(0.20) / denom
 
-        // 4. Project 3D points onto local plane coordinates (u, v)
-        val projected2D = points3D.map { pt ->
-            val diff = Point3D(pt.x - centroid.x, pt.y - centroid.y, pt.z - centroid.z)
-            Point2DProjected(
-                u = dot(diff, uAxis),
-                v = dot(diff, vAxis)
-            )
-        }
+        val xW = t * u
+        val yW = 0.0
+        val zW = t * (cosT - v * sinT)
 
-        // 5. Execute Gauss's Shoelace Formula on projected plane (u, v)
-        val rawArea = calculateShoelaceArea(projected2D)
-        val roundedArea = Math.round(rawArea * 1000.0) / 1000.0
-
-        // 6. Compute true 3D edge distances and perimeter
-        val edgeDistances = mutableListOf<Double>()
-        var perimeter = 0.0
-        for (i in points3D.indices) {
-            val next = (i + 1) % points3D.size
-            val d = distance(points3D[i], points3D[next])
-            val roundedD = Math.round(d * 100.0) / 100.0
-            edgeDistances.add(roundedD)
-            perimeter += d
-        }
-        val roundedPerimeter = Math.round(perimeter * 100.0) / 100.0
-
-        return PrecisionAreaResult(
-            areaM2 = roundedArea,
-            perimeterM = roundedPerimeter,
-            edgeDistancesM = edgeDistances,
-            surfaceNormal = normal,
-            centroid = centroid
+        return Point3D(
+            Math.round(xW * 10000.0) / 10000.0,
+            yW,
+            Math.round(zW.coerceAtLeast(0.05) * 10000.0) / 10000.0
         )
     }
 
     /**
-     * Shoelace Formula (Gauss's Area Formula) on 2D coplanar coordinates
+     * Strategy 2: Computes the 3x3 Homography Matrix H and its inverse H_inv
+     * mapping between image plane and ground plane.
      */
-    fun calculateShoelaceArea(points: List<Point2DProjected>): Double {
-        val n = points.size
-        if (n < 3) return 0.0
+    fun computePlanarHomography(
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        pitchOverrideRad: Double? = null
+    ): Pair<Array<DoubleArray>, Array<DoubleArray>> {
+        val theta = pitchOverrideRad ?: pose.pitchRad.coerceIn(0.10, 1.50)
+        val cosT = cos(theta)
+        val sinT = sin(theta)
+        val cosR = cos(pose.rollRad)
+        val sinR = sin(pose.rollRad)
+        val h = pose.heightM.coerceAtLeast(0.20)
+
+        // Intrinsic Matrix K
+        val K = arrayOf(
+            doubleArrayOf(intrinsics.fx, 0.0, intrinsics.cx),
+            doubleArrayOf(0.0, intrinsics.fy, intrinsics.cy),
+            doubleArrayOf(0.0, 0.0, 1.0)
+        )
+
+        // Roll Rotation Matrix
+        val R_roll = arrayOf(
+            doubleArrayOf(cosR, sinR, 0.0),
+            doubleArrayOf(-sinR, cosR, 0.0),
+            doubleArrayOf(0.0, 0.0, 1.0)
+        )
+
+        // Extrinsics for planar ground Y = 0: [r1, r3, t]
+        val E = arrayOf(
+            doubleArrayOf(1.0, 0.0, 0.0),
+            doubleArrayOf(0.0, -sinT, h * cosT),
+            doubleArrayOf(0.0, cosT, h * sinT)
+        )
+
+        val RE = matMul3x3(R_roll, E)
+        val H = matMul3x3(K, RE)
+        val H_inv = invert3x3(H) ?: arrayOf(
+            doubleArrayOf(1.0, 0.0, 0.0),
+            doubleArrayOf(0.0, 1.0, 0.0),
+            doubleArrayOf(0.0, 0.0, 1.0)
+        )
+
+        return Pair(H, H_inv)
+    }
+
+    /**
+     * Strategy 2: Unproject screen point via H_inv to 2D metric Bird's Eye coordinates (X, Z)
+     */
+    fun unprojectViaHomography(screenPt: Point2D, hInv: Array<DoubleArray>): Point2D {
+        val x = hInv[0][0] * screenPt.x + hInv[0][1] * screenPt.y + hInv[0][2]
+        val z = hInv[1][0] * screenPt.x + hInv[1][1] * screenPt.y + hInv[1][2]
+        val w = hInv[2][0] * screenPt.x + hInv[2][1] * screenPt.y + hInv[2][2]
+        val safeW = if (abs(w) > 1e-9) w else 1e-9
+        return Point2D(x / safeW, z / safeW)
+    }
+
+    /**
+     * Strategy 3: Dynamic Per-Vertex Depth & Scale-per-pixel (m/px)
+     */
+    fun computeVertexDepthsAndScales(
+        screenPts: List<Point2D>,
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        pitchRad: Double
+    ): Pair<List<Double>, List<Double>> {
+        val depths = mutableListOf<Double>()
+        val scales = mutableListOf<Double>()
+        val h = pose.heightM.coerceAtLeast(0.20)
+
+        for (pt in screenPts) {
+            val p3D = raycastScreenToGround(pt, intrinsics, pose, pitchRad)
+            val slantDist = sqrt(p3D.x * p3D.x + h * h + p3D.z * p3D.z)
+            depths.add(Math.round(slantDist * 1000.0) / 1000.0)
+            val scale = slantDist / intrinsics.fx
+            scales.add(Math.round(scale * 100000.0) / 100000.0)
+        }
+        return Pair(depths, scales)
+    }
+
+    /**
+     * RULE 6: Vertical Plane Detection & Raycasting (ARPlane.Type.VERTICAL)
+     * Raycasts a 2D screen coordinate onto a vertical plane at a known distance.
+     */
+    fun raycastScreenToVerticalWall(
+        screenPt: Point2D,
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        wallDistanceM: Double = 2.0,
+        rollRad: Double = 0.0
+    ): Point3D {
+        val dx = screenPt.x - intrinsics.cx
+        val dy = screenPt.y - intrinsics.cy
+
+        // Lateral roll compensation
+        var px = dx
+        var py = dy
+        if (abs(rollRad) > 0.001) {
+            val cosR = cos(-rollRad)
+            val sinR = sin(-rollRad)
+            px = dx * cosR - dy * sinR
+            py = dx * sinR + dy * cosR
+        }
+
+        val u = px / intrinsics.fx
+        val v = py / intrinsics.fy
+
+        val theta = pose.pitchRad.coerceIn(-1.50, 1.50)
+        val cosT = cos(theta)
+        val sinT = sin(theta)
+
+        // Ray direction in 3D camera coordinates
+        val dirY = -(v * cosT + sinT)
+        val dirZ = cosT - v * sinT
+
+        val safeZ = if (abs(dirZ) > 0.05) dirZ else (if (dirZ >= 0) 0.05 else -0.05)
+        val t = wallDistanceM / safeZ
+
+        val xWorld = t * u
+        val yWorld = pose.heightM + (t * dirY)
+        val zWorld = wallDistanceM
+
+        return Point3D(
+            Math.round(xWorld * 10000.0) / 10000.0,
+            Math.round(yWorld * 10000.0) / 10000.0,
+            Math.round(zWorld * 10000.0) / 10000.0
+        )
+    }
+
+    /**
+     * RULE 6: Measures vertical height strictly along the gravity vector (Y-axis) between two points
+     * Formula: H = |Y_top - Y_bottom|
+     */
+    fun computeVerticalHeight(
+        pTop: Point2D,
+        pBottom: Point2D,
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        wallDistanceM: Double = 2.0,
+        rollRad: Double = 0.0
+    ): Triple<Double, Double, Double> {
+        val p3DTop = raycastScreenToVerticalWall(pTop, intrinsics, pose, wallDistanceM, rollRad)
+        val p3DBottom = raycastScreenToVerticalWall(pBottom, intrinsics, pose, wallDistanceM, rollRad)
+
+        // Gravity-aligned vertical height
+        val heightM = abs(p3DTop.y - p3DBottom.y)
+        val horizontalOffsetM = abs(p3DTop.x - p3DBottom.x)
+        val straightDistM = distance3D(p3DTop, p3DBottom)
+
+        return Triple(
+            Math.round(heightM * 1000.0) / 1000.0,
+            Math.round(horizontalOffsetM * 1000.0) / 1000.0,
+            Math.round(straightDistM * 1000.0) / 1000.0
+        )
+    }
+
+    /**
+     * RULE 6: Soil Excavation Volume Calculation
+     * Formula: V = Area * Depth
+     */
+    fun computeSoilExcavationVolume(
+        surfaceAreaM2: Double,
+        measuredDepthM: Double
+    ): Double {
+        val safeArea = surfaceAreaM2.coerceAtLeast(0.0)
+        val safeDepth = measuredDepthM.coerceAtLeast(0.0)
+        return Math.round((safeArea * safeDepth) * 10000.0) / 10000.0
+    }
+
+    /**
+     * Strategy 4: Multi-Strategy Fusion Engine with Cross-Verification & Self-Correction
+     */
+    fun calculateFusedPrecisionArea(
+        screenPoints: List<Point2D>,
+        intrinsics: CameraIntrinsics,
+        pose: CameraSpatialPose,
+        scaleMultiplier: Double = 1.0
+    ): FusedPrecisionAreaResult {
+        if (screenPoints.size < 3) {
+            return FusedPrecisionAreaResult(
+                areaM2 = 0.0,
+                areaShoelace3DM2 = 0.0,
+                areaHomographyBirdEyeM2 = 0.0,
+                strategyDiscrepancyPercent = 0.0,
+                convergenceIterCount = 0,
+                optimizedPitchDeg = Math.toDegrees(pose.pitchRad),
+                perimeterM = 0.0,
+                edgeLengthsM = emptyList(),
+                vertexDepthsM = emptyList(),
+                vertexMetricScaleMPerPx = emptyList(),
+                homographyMatrix = emptyArray(),
+                birdEyeCoordinates = emptyList(),
+                centroid3D = Point3D(0.0, 0.0, 0.0),
+                surfaceNormal = Point3D(0.0, 1.0, 0.0)
+            )
+        }
+
+        var currentPitch = pose.pitchRad.coerceIn(0.10, 1.50)
+        var iterCount = 0
+        val maxIters = 8
+
+        fun evaluate(pitch: Double): EvaluationResult {
+            // Strategy 1: Raycast to 3D Plane
+            val pts3D = screenPoints.map { raycastScreenToGround(it, intrinsics, pose, pitch) }
+            val areaA = shoelace3DGround(pts3D) * (scaleMultiplier * scaleMultiplier)
+
+            // Strategy 2: Homography Bird's Eye View
+            val (H, H_inv) = computePlanarHomography(intrinsics, pose, pitch)
+            val birdEye = screenPoints.map { unprojectViaHomography(it, H_inv) }
+            val areaB = shoelace2D(birdEye) * (scaleMultiplier * scaleMultiplier)
+
+            val avg = (areaA + areaB) / 2.0
+            val disc = if (avg > 1e-6) (abs(areaA - areaB) / avg) * 100.0 else 0.0
+
+            return EvaluationResult(areaA, areaB, disc, pts3D, birdEye, H)
+        }
+
+        var eval = evaluate(currentPitch)
+
+        // Convergence loop if discrepancy > 1%
+        if (eval.discrepancy > 1.0) {
+            var step = Math.toRadians(1.5)
+            for (i in 0 until maxIters) {
+                if (eval.discrepancy <= 0.05) break
+                iterCount++
+                val evalUp = evaluate(currentPitch + step)
+                val evalDown = evaluate(currentPitch - step)
+
+                if (evalUp.discrepancy < eval.discrepancy) {
+                    currentPitch += step
+                    eval = evalUp
+                } else if (evalDown.discrepancy < eval.discrepancy) {
+                    currentPitch -= step
+                    eval = evalDown
+                } else {
+                    step *= 0.5
+                }
+            }
+        }
+
+        val fusedArea = (eval.areaA + eval.areaB) / 2.0
+        val roundedArea = Math.round(fusedArea * 1000.0) / 1000.0
+
+        // Strategy 3: Dynamic Depths and Scales
+        val (depths, scales) = computeVertexDepthsAndScales(screenPoints, intrinsics, pose, currentPitch)
+
+        // 3D Perimeter and Edge Lengths
+        val edgeLengths = mutableListOf<Double>()
+        var perimeter = 0.0
+        for (i in eval.pts3D.indices) {
+            val next = (i + 1) % eval.pts3D.size
+            val d = distance3D(eval.pts3D[i], eval.pts3D[next]) * scaleMultiplier
+            edgeLengths.add(Math.round(d * 100.0) / 100.0)
+            perimeter += d
+        }
+
+        // Centroid 3D
+        var sumX = 0.0
+        var sumZ = 0.0
+        eval.pts3D.forEach { sumX += it.x; sumZ += it.z }
+        val cnt = eval.pts3D.size.toDouble()
+        val centroid = Point3D(sumX / cnt, 0.0, sumZ / cnt)
+
+        return FusedPrecisionAreaResult(
+            areaM2 = roundedArea,
+            areaShoelace3DM2 = Math.round(eval.areaA * 1000.0) / 1000.0,
+            areaHomographyBirdEyeM2 = Math.round(eval.areaB * 1000.0) / 1000.0,
+            strategyDiscrepancyPercent = Math.round(eval.discrepancy * 100.0) / 100.0,
+            convergenceIterCount = iterCount,
+            optimizedPitchDeg = Math.round(Math.toDegrees(currentPitch) * 10.0) / 10.0,
+            perimeterM = Math.round(perimeter * 100.0) / 100.0,
+            edgeLengthsM = edgeLengths,
+            vertexDepthsM = depths,
+            vertexMetricScaleMPerPx = scales,
+            homographyMatrix = eval.H,
+            birdEyeCoordinates = eval.birdEye,
+            centroid3D = centroid,
+            surfaceNormal = Point3D(0.0, 1.0, 0.0)
+        )
+    }
+
+    private data class EvaluationResult(
+        val areaA: Double,
+        val areaB: Double,
+        val discrepancy: Double,
+        val pts3D: List<Point3D>,
+        val birdEye: List<Point2D>,
+        val H: Array<DoubleArray>
+    )
+
+    private fun shoelace3DGround(pts: List<Point3D>): Double {
         var sum = 0.0
+        val n = pts.size
         for (i in 0 until n) {
             val next = (i + 1) % n
-            sum += points[i].u * points[next].v
-            sum -= points[next].u * points[i].v
+            sum += pts[i].x * pts[next].z - pts[next].x * pts[i].z
         }
         return abs(sum) * 0.5
     }
 
-    private fun computePolygonNormalNewell(points: List<Point3D>): Point3D {
-        var nx = 0.0
-        var ny = 0.0
-        var nz = 0.0
-        val n = points.size
+    private fun shoelace2D(pts: List<Point2D>): Double {
+        var sum = 0.0
+        val n = pts.size
         for (i in 0 until n) {
-            val cur = points[i]
-            val next = points[(i + 1) % n]
-            nx += (cur.y - next.y) * (cur.z + next.z)
-            ny += (cur.z - next.z) * (cur.x + next.x)
-            nz += (cur.x - next.x) * (cur.y + next.y)
+            val next = (i + 1) % n
+            sum += pts[i].x * pts[next].y - pts[next].x * pts[i].y
         }
-        val norm = normalize(Point3D(nx, ny, nz))
-        return if (norm.y < 0) Point3D(-norm.x, -norm.y, -norm.z) else norm
+        return abs(sum) * 0.5
     }
 
-    private fun distance(a: Point3D, b: Point3D): Double {
+    private fun distance3D(a: Point3D, b: Point3D): Double {
         val dx = b.x - a.x
         val dy = b.y - a.y
         val dz = b.z - a.z
         return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
-    private fun dot(a: Point3D, b: Point3D): Double = a.x * b.x + a.y * b.y + a.z * b.z
+    private fun matMul3x3(A: Array<DoubleArray>, B: Array<DoubleArray>): Array<DoubleArray> {
+        val C = Array(3) { DoubleArray(3) }
+        for (i in 0..2) {
+            for (j in 0..2) {
+                var sum = 0.0
+                for (k in 0..2) {
+                    sum += A[i][k] * B[k][j]
+                }
+                C[i][j] = sum
+            }
+        }
+        return C
+    }
 
-    private fun cross(a: Point3D, b: Point3D): Point3D = Point3D(
-        x = a.y * b.z - a.z * b.y,
-        y = a.z * b.x - a.x * b.z,
-        z = a.x * b.y - a.y * b.x
-    )
+    private fun invert3x3(M: Array<DoubleArray>): Array<DoubleArray>? {
+        val m00 = M[0][0]; val m01 = M[0][1]; val m02 = M[0][2]
+        val m10 = M[1][0]; val m11 = M[1][1]; val m12 = M[1][2]
+        val m20 = M[2][0]; val m21 = M[2][1]; val m22 = M[2][2]
 
-    private fun normalize(v: Point3D): Point3D {
-        val len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
-        return if (len < 1e-7) Point3D(0.0, 1.0, 0.0) else Point3D(v.x / len, v.y / len, v.z / len)
+        val det = m00 * (m11 * m22 - m12 * m21) -
+                  m01 * (m10 * m22 - m12 * m20) +
+                  m02 * (m10 * m21 - m11 * m20)
+
+        if (abs(det) < 1e-14) return null
+        val invDet = 1.0 / det
+
+        return arrayOf(
+            doubleArrayOf(
+                (m11 * m22 - m12 * m21) * invDet,
+                (m02 * m21 - m01 * m22) * invDet,
+                (m01 * m12 - m02 * m11) * invDet
+            ),
+            doubleArrayOf(
+                (m12 * m20 - m10 * m22) * invDet,
+                (m00 * m22 - m02 * m20) * invDet,
+                (m02 * m10 - m00 * m12) * invDet
+            ),
+            doubleArrayOf(
+                (m10 * m21 - m11 * m20) * invDet,
+                (m01 * m20 - m00 * m21) * invDet,
+                (m00 * m11 - m01 * m10) * invDet
+            )
+        )
     }
 }
 `,
