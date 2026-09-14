@@ -17,9 +17,10 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        // Local directory repositories for Huawei AR Engine AAR SDK (ar engine sdk 4.0.0.5.aar)
+        // Local directory repositories for Huawei AR Engine AAR SDK (ar engine sdk 4.0.0.5.aar / ARCore SDK 4005.aar)
         flatDir {
             dirs(
+                file("\${rootDir}/assets/.aistudio"),
                 file("\${rootDir}/assets"),
                 file("\${rootDir}/assets/libs"),
                 file("\${rootDir}/app/src/main/assets"),
@@ -81,9 +82,10 @@ android {
 repositories {
     google()
     mavenCentral()
-    // Local Huawei SDK lookup (ar engine sdk 4.0.0.5.aar placed in assets/ or libs/)
+    // Local Huawei SDK lookup (ar engine sdk 4.0.0.5.aar / ARCore SDK 4005.aar in assets/.aistudio, assets/, or libs/)
     flatDir {
         dirs(
+            file("\${rootDir}/assets/.aistudio"),
             file("\${rootDir}/assets"),
             file("\${rootDir}/assets/libs"),
             file("\${rootDir}/app/src/main/assets"),
@@ -110,8 +112,9 @@ dependencies {
     // Google ARCore SDK
     implementation("com.google.ar:core:1.47.0")
 
-    // Local Huawei AR Engine SDK (ar engine sdk 4.0.0.5.aar / arenginesdk-4.0.0.5.aar in assets/ or libs/)
+    // Local Huawei AR Engine SDK (ar engine sdk 4.0.0.5.aar / arenginesdk-4.0.0.5.aar / ARCore SDK 4005.aar in assets/.aistudio, assets/, or libs/)
     // Local offline resolution - NO remote maven fetching:
+    implementation(fileTree(mapOf("dir" to "\${rootDir}/assets/.aistudio", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "\${rootDir}/assets", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "\${rootDir}/assets/libs", "include" to listOf("*.aar", "*.jar"))))
     implementation(fileTree(mapOf("dir" to "src/main/assets", "include" to listOf("*.aar", "*.jar"))))
@@ -1143,6 +1146,195 @@ class ArSpatialAnchorPipeline(
     fun clearAnchors() {
         attachedAnchors.forEach { it.detach() }
         attachedAnchors.clear()
+    }
+}
+`,
+  },
+  {
+    path: 'HuaweiAREngineNativePipeline.kt',
+    name: 'app/src/main/java/com/argarden/soilcalculator/ar/HuaweiAREngineNativePipeline.kt',
+    language: 'kotlin',
+    descriptionAr: 'معالج وتكامل مكتبة arengine SDK 4005.aar / ARCore SDK 4005.aar المحلية لمعالجة تتبع الأسطح (ARPlane) وسحابة النقاط (ARPointCloud) وحساب المساحة الحقيقية بالمتر المربع',
+    content: `package com.argarden.soilcalculator.ar
+
+import android.content.Context
+import com.huawei.hiar.*
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+/**
+ * Direct High-Precision Integration Pipeline for Huawei AR Engine SDK (arengine SDK 4005.aar / ARCore SDK 4005.aar)
+ * Located in assets/.aistudio/
+ * 
+ * Features:
+ * 1. Surface Plane Tracking (ARPlane.PlaneType.HORIZONTAL_UPWARD_FACING & VERTICAL)
+ * 2. Point Cloud Extraction (ARPointCloud)
+ * 3. 3D Metric Raycast Hit Testing (ARHitResult)
+ * 4. Ground Surface Invariant Real-World Metric Area Shoelace Calculation (Delta Y = 0)
+ */
+class HuaweiAREngineNativePipeline(private val context: Context) {
+
+    private var arSession: ARSession? = null
+    private var isTracking = false
+    private val activeAnchors = mutableListOf<ARAnchor>()
+
+    fun initializeSession(): Boolean {
+        return try {
+            arSession = ARSession(context)
+            val config = ARWorldTrackingConfig(arSession)
+            config.planeFindingMode = ARConfigBase.PlaneFindingMode.ENABLE
+            config.lightingMode = ARConfigBase.LightingMode.AMBIENT_INTENSITY
+            config.focusMode = ARConfigBase.FocusMode.AUTO_FOCUS
+            config.updateMode = ARConfigBase.UpdateMode.BLOCKING
+            arSession?.configure(config)
+            arSession?.resume()
+            isTracking = true
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    fun pause() {
+        arSession?.pause()
+        isTracking = false
+    }
+
+    fun resume() {
+        arSession?.resume()
+        isTracking = true
+    }
+
+    /**
+     * Extracts all verified horizontal planes currently tracked by Huawei AR Engine SDK
+     */
+    fun getDetectedHorizontalPlanes(frame: ARFrame): List<ARPlane> {
+        val planes = mutableListOf<ARPlane>()
+        val trackables = arSession?.getAllTrackables(ARPlane::class.java) ?: return emptyList()
+        for (trackable in trackables) {
+            if (trackable is ARPlane && 
+                trackable.trackingState == ARTrackable.TrackingState.TRACKING &&
+                trackable.type == ARPlane.PlaneType.HORIZONTAL_UPWARD_FACING) {
+                planes.add(trackable)
+            }
+        }
+        return planes
+    }
+
+    /**
+     * Extracts Feature Point Cloud data from Huawei AR Engine
+     */
+    fun extractPointCloud(frame: ARFrame): List<Point3D> {
+        val cloudPoints = mutableListOf<Point3D>()
+        try {
+            val pointCloud: ARPointCloud = frame.acquirePointCloud()
+            val pointsBuffer = pointCloud.points // FloatBuffer [X, Y, Z, Confidence]
+            val count = pointCloud.pointsNumber
+            pointsBuffer.rewind()
+            for (i in 0 until count) {
+                if (pointsBuffer.remaining() >= 4) {
+                    val x = pointsBuffer.get().toDouble()
+                    val y = pointsBuffer.get().toDouble()
+                    val z = pointsBuffer.get().toDouble()
+                    val conf = pointsBuffer.get().toDouble()
+                    if (conf > 0.3) {
+                        cloudPoints.add(Point3D(x, y, z))
+                    }
+                }
+            }
+            pointCloud.release()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return cloudPoints
+    }
+
+    /**
+     * Raycasts a 2D screen coordinate against detected ARPlanes to obtain the exact 3D World metric point
+     */
+    fun hitTestTo3DAnchor(frame: ARFrame, screenX: Float, screenY: Float): ARAnchor? {
+        val hitList: List<ARHitResult> = frame.hitTest(screenX, screenY)
+        for (hit in hitList) {
+            val trackable = hit.trackable
+            if (trackable is ARPlane && 
+                trackable.trackingState == ARTrackable.TrackingState.TRACKING &&
+                trackable.isPoseInPolygon(hit.hitPose)) {
+                val anchor = hit.createAnchor()
+                activeAnchors.add(anchor)
+                return anchor
+            }
+        }
+        return null
+    }
+
+    /**
+     * Calculates the exact real-world metric surface area (m²) from attached 3D ARAnchors
+     * Enforcing strict horizontal plane projection (Delta Y = 0) with zero perspective distortion
+     */
+    fun calculateRealWorldSurfaceArea(): FusedPrecisionAreaResult {
+        val points3D = activeAnchors.map { anchor ->
+            val pose = anchor.pose
+            Point3D(
+                x = pose.tx().toDouble(),
+                y = 0.0, // Enforce Delta Y = 0 on horizontal tracking plane
+                z = pose.tz().toDouble()
+            )
+        }
+
+        // Calculate 3D Shoelace Area
+        var sum = 0.0
+        val n = points3D.size
+        for (i in 0 until n) {
+            val next = (i + 1) % n
+            sum += points3D[i].x * points3D[next].z - points3D[next].x * points3D[i].z
+        }
+        val exactAreaM2 = abs(sum) * 0.5
+
+        // Compute perimeter and edges
+        val edgeLengths = mutableListOf<Double>()
+        var perimeter = 0.0
+        for (i in 0 until n) {
+            val next = (i + 1) % n
+            val dx = points3D[next].x - points3D[i].x
+            val dz = points3D[next].z - points3D[i].z
+            val d = sqrt(dx * dx + dz * dz)
+            edgeLengths.add(Math.round(d * 100.0) / 100.0)
+            perimeter += d
+        }
+
+        return FusedPrecisionAreaResult(
+            areaM2 = Math.round(exactAreaM2 * 1000.0) / 1000.0,
+            areaShoelace3DM2 = exactAreaM2,
+            areaHomographyBirdEyeM2 = exactAreaM2,
+            strategyDiscrepancyPercent = 0.0,
+            convergenceIterCount = 1,
+            optimizedPitchDeg = 0.0,
+            perimeterM = Math.round(perimeter * 100.0) / 100.0,
+            edgeLengthsM = edgeLengths,
+            vertexDepthsM = points3D.map { sqrt(it.x * it.x + it.z * it.z) },
+            vertexMetricScaleMPerPx = emptyList(),
+            homographyMatrix = emptyArray(),
+            birdEyeCoordinates = points3D.map { Point2D(it.x, it.z) },
+            centroid3D = Point3D(
+                points3D.sumOf { it.x } / n.coerceAtLeast(1),
+                0.0,
+                points3D.sumOf { it.z } / n.coerceAtLeast(1)
+            ),
+            surfaceNormal = Point3D(0.0, 1.0, 0.0)
+        )
+    }
+
+    fun clearAnchors() {
+        activeAnchors.forEach { it.detach() }
+        activeAnchors.clear()
+    }
+
+    fun release() {
+        clearAnchors()
+        arSession?.stop()
+        arSession = null
+        isTracking = false
     }
 }
 `,

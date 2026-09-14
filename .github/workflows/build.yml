@@ -80,6 +80,27 @@ jobs:
           convert icon-base.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
           convert icon-base.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
 
+      - name: Configure AR Engine SDK Dependencies
+        run: |
+          mkdir -p android/app/libs
+          # نسخ أي ملفات AAR متوفرة في assets أو assets/.aistudio إلى مجلد libs الخاص بتطبيق الأندرويد
+          if [ -d "assets/.aistudio" ]; then
+            cp assets/.aistudio/*.aar android/app/libs/ 2>/dev/null || true
+          fi
+          if [ -d "assets" ]; then
+            cp assets/*.aar android/app/libs/ 2>/dev/null || true
+          fi
+
+          # التحقق من تعريف ملفات AAR و flatDir في android/app/build.gradle
+          if [ -f android/app/build.gradle ]; then
+            if ! grep -q "flatDir" android/app/build.gradle; then
+              echo "repositories { flatDir { dirs 'libs', '../../assets/.aistudio', '../../assets' } }" >> android/app/build.gradle
+            fi
+            if ! grep -q "fileTree" android/app/build.gradle; then
+              echo "dependencies { implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar']) }" >> android/app/build.gradle
+            fi
+          fi
+
       - name: Sync Capacitor Android
         run: npx cap sync android
 
