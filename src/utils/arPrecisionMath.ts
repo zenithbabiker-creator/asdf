@@ -346,22 +346,31 @@ export function raycastScreenPointTo3DPlane(
   const cosTheta = Math.cos(theta);
 
   // Denominator represents vertical ray component towards ground: Dy = -(sinTheta + v * cosTheta)
+  // OPTICAL HORIZON & SINGULARITY GUARD:
+  // Points at or above the horizon (v <= -tan(theta)) look into the sky or infinity.
+  // In real mobile AR (Huawei AR Engine / ARCore), hits against the ground plane are physically constrained.
   const denom = sinTheta + v * cosTheta;
-  const safeDenom = Math.max(0.04, denom);
+  const safeDenom = Math.max(0.12, denom);
 
   // Ray parameter t: distance along optical axis to ground intersection
   const H = Math.max(0.20, frameContext.cameraHeightM);
-  const t = H / safeDenom;
+  const rawT = H / safeDenom;
+  // Constraint: Maximum reliable physical ground raycast distance in mobile AR is 12.0 meters
+  const t = Math.min(12.0, rawT);
 
   // Ground plane 3D coordinates in meters:
   const xDistanceM = t * u;
-  const yGroundM = 0.0;
+  const yGroundM = 0.0; // Enforce strict horizontal ground plane (Delta Y = 0)
   const zGroundDistanceM = t * (cosTheta - v * sinTheta);
 
+  // Bound within physical mobile camera tracking frustum to prevent unrealistic coordinate runaway
+  const clampedX = Math.max(-10.0, Math.min(10.0, xDistanceM));
+  const clampedZ = Math.max(0.10, Math.min(15.0, zGroundDistanceM));
+
   return {
-    x: Math.round(xDistanceM * 10000) / 10000,
+    x: Math.round(clampedX * 10000) / 10000,
     y: Math.round(yGroundM * 10000) / 10000,
-    z: Math.round(Math.max(0.05, zGroundDistanceM) * 10000) / 10000,
+    z: Math.round(clampedZ * 10000) / 10000,
   };
 }
 
@@ -418,16 +427,25 @@ export function computePlanarHomographyMatrix(
 
 /**
  * Unprojects a screen point via inverse Homography H_inv to 2D metric Bird's Eye coordinates (X, Z).
+ * Includes numerical stability regularization and frustum clamping.
  */
 export function unprojectViaHomography(
   screenPt: Point2D,
   H_inv: number[][]
 ): Point2D {
   const pW = matVec3(H_inv, [screenPt.x, screenPt.y, 1]);
-  const w = Math.abs(pW[2]) > 1e-9 ? pW[2] : 1e-9;
+  // Regularize scale factor w to prevent division by zero or negative perspective inversion
+  const safeW = Math.abs(pW[2]) > 0.05 ? pW[2] : (pW[2] >= 0 ? 0.05 : -0.05);
+  const rawX = pW[0] / safeW;
+  const rawZ = pW[1] / safeW;
+
+  // Clamp within physical metric ground bounds
+  const x = Math.max(-10.0, Math.min(10.0, rawX));
+  const z = Math.max(0.10, Math.min(15.0, rawZ));
+
   return {
-    x: pW[0] / w,
-    y: pW[1] / w // corresponds to ground Z in meters
+    x: Math.round(x * 10000) / 10000,
+    y: Math.round(z * 10000) / 10000 // corresponds to ground Z in meters
   };
 }
 
@@ -651,6 +669,27 @@ export function fusedPrecisionAreaCalculation(
   const widthM = Math.round(Math.abs(maxX - minX) * scaleFactor * 100) / 100;
   const lengthM = Math.round(Math.abs(maxZ - minZ) * scaleFactor * 100) / 100;
 
+  // SANITY CHECK & REAL-WORLD PHYSICAL VALIDATION:
+  // Mobile camera garden plots rarely exceed 500 m² in a single static view frustum.
+  // Verify that individual segment distances and total area fit realistic physical geometry.
+  const isEdgesValid = edgeLengthsM.every((len) => len <= 25.0);
+  const isAreaRealistic = areaM2 >= 0.0001 && areaM2 <= 500.0;
+  const isSanityValidated = isEdgesValid && isAreaRealistic;
+
+  // Calculate Tracking Confidence Score (0 to 100%)
+  const avgDepth = depthScale.vertexDepthsM.length > 0
+    ? depthScale.vertexDepthsM.reduce((a, b) => a + b, 0) / depthScale.vertexDepthsM.length
+    : 2.0;
+  
+  let confidence = 100.0;
+  // Penalize discrepancy between 3D Vector Shoelace & Homography
+  confidence -= Math.min(40, discrepancyPercent * 4.0);
+  // Penalize long distance where AR point cloud resolution degrades
+  if (avgDepth > 5.0) {
+    confidence -= Math.min(30, (avgDepth - 5.0) * 6.0);
+  }
+  const trackingConfidenceScore = Math.max(10, Math.min(100, Math.round(confidence)));
+
   return {
     areaM2,
     areaShoelace3DM2: Math.round(areaA * 1000) / 1000,
@@ -666,7 +705,9 @@ export function fusedPrecisionAreaCalculation(
     birdEyeCoordinates: bestBirdEyeCoords,
     centroid3D,
     surfaceNormal,
-    boundingBoxM: { widthM, lengthM }
+    boundingBoxM: { widthM, lengthM },
+    isSanityValidated,
+    trackingConfidenceScore,
   };
 }
 

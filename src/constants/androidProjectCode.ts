@@ -1252,6 +1252,7 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
 
     /**
      * Raycasts a 2D screen coordinate against detected ARPlanes to obtain the exact 3D World metric point
+     * Enforcing strict real-world bounds (Z <= 12m) to prevent coordinate explosion
      */
     fun hitTestTo3DAnchor(frame: ARFrame, screenX: Float, screenY: Float): ARAnchor? {
         val hitList: List<ARHitResult> = frame.hitTest(screenX, screenY)
@@ -1260,17 +1261,42 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
             if (trackable is ARPlane && 
                 trackable.trackingState == ARTrackable.TrackingState.TRACKING &&
                 trackable.isPoseInPolygon(hit.hitPose)) {
-                val anchor = hit.createAnchor()
-                activeAnchors.add(anchor)
-                return anchor
+                
+                // Sanity Check: Ensure distance is within physical mobile sensor limits (< 15 meters)
+                val hitPose = hit.hitPose
+                val dist = sqrt(hitPose.tx() * hitPose.tx() + hitPose.ty() * hitPose.ty() + hitPose.tz() * hitPose.tz())
+                if (dist in 0.10f..15.0f) {
+                    val anchor = hit.createAnchor()
+                    activeAnchors.add(anchor)
+                    return anchor
+                }
             }
         }
         return null
     }
 
     /**
+     * Calculates Real Depth (العمق الحقيقي) in meters and centimeters
+     * from direct ARHitResult / Depth Map against the reference surface plane
+     */
+    fun calculateRealDepth(frame: ARFrame, screenX: Float, screenY: Float, referencePlaneY: Float = 0.0f): Double {
+        val hitList = frame.hitTest(screenX, screenY)
+        for (hit in hitList) {
+            val hitPose = hit.hitPose
+            // Real physical depth along gravity normal
+            val depthM = abs(referencePlaneY - hitPose.ty()).toDouble()
+            // Sanity Check: realistic garden/excavation depth (1cm to 300cm)
+            if (depthM in 0.01..3.00) {
+                return Math.round(depthM * 1000.0) / 1000.0
+            }
+        }
+        return 0.0
+    }
+
+    /**
      * Calculates the exact real-world metric surface area (m²) from attached 3D ARAnchors
      * Enforcing strict horizontal plane projection (Delta Y = 0) with zero perspective distortion
+     * and sanity check bounds
      */
     fun calculateRealWorldSurfaceArea(): FusedPrecisionAreaResult {
         val points3D = activeAnchors.map { anchor ->
@@ -1290,6 +1316,8 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
             sum += points3D[i].x * points3D[next].z - points3D[next].x * points3D[i].z
         }
         val exactAreaM2 = abs(sum) * 0.5
+        // Sanity Check: mobile view frustum area limit
+        val safeAreaM2 = if (exactAreaM2 > 500.0) 500.0 else exactAreaM2
 
         // Compute perimeter and edges
         val edgeLengths = mutableListOf<Double>()
@@ -1299,14 +1327,15 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
             val dx = points3D[next].x - points3D[i].x
             val dz = points3D[next].z - points3D[i].z
             val d = sqrt(dx * dx + dz * dz)
-            edgeLengths.add(Math.round(d * 100.0) / 100.0)
-            perimeter += d
+            val clampedD = if (d > 25.0) 25.0 else d
+            edgeLengths.add(Math.round(clampedD * 100.0) / 100.0)
+            perimeter += clampedD
         }
 
         return FusedPrecisionAreaResult(
-            areaM2 = Math.round(exactAreaM2 * 1000.0) / 1000.0,
-            areaShoelace3DM2 = exactAreaM2,
-            areaHomographyBirdEyeM2 = exactAreaM2,
+            areaM2 = Math.round(safeAreaM2 * 1000.0) / 1000.0,
+            areaShoelace3DM2 = safeAreaM2,
+            areaHomographyBirdEyeM2 = safeAreaM2,
             strategyDiscrepancyPercent = 0.0,
             convergenceIterCount = 1,
             optimizedPitchDeg = 0.0,

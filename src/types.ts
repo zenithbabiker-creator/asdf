@@ -134,6 +134,8 @@ export interface FusedPrecisionAreaResult {
   centroid3D: Point3D;
   surfaceNormal: Point3D;
   boundingBoxM: { widthM: number; lengthM: number };
+  isSanityValidated?: boolean;          // True if numbers passed physical boundary check
+  trackingConfidenceScore?: number;     // 0 to 100 confidence score based on sensor stability & distance
 }
 
 export interface CalculationResult {
