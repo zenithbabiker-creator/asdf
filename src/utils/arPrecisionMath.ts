@@ -937,6 +937,82 @@ export function computeVerticalHeight(
 }
 
 /**
+ * RULE: Mode 1 - Area Only (MODE_AREA)
+ * Gauss's Area Formula (Shoelace Algorithm) on projected 2D ground plane (X, Z)
+ * Area = 0.5 * |sum(X_i * Z_{i+1} - X_{i+1} * Z_i)|
+ * Output strictly in square meters (m²)
+ */
+export function computeGaussAreaShoelace(points: Point3D[]): number {
+  if (!points || points.length < 3) return 0.0;
+  let sum = 0.0;
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const next = (i + 1) % n;
+    sum += points[i].x * points[next].z - points[next].x * points[i].z;
+  }
+  const exactAreaM2 = Math.abs(sum) * 0.5;
+  return Math.round(exactAreaM2 * 1000) / 1000;
+}
+
+/**
+ * RULE: Mode 2 - Depth Only (MODE_DEPTH)
+ * Computes orthogonal distance from baseline reference plane to target point:
+ * d_depth = | n · (P_target - P_plane) |
+ * Output strictly in meters (m) / centimeters (cm)
+ */
+export function computeOrthogonalDepth(
+  targetPoint: Point3D,
+  planePoint: Point3D,
+  planeNormal: Point3D = { x: 0, y: 1, z: 0 }
+): { depthM: number; depthCm: number } {
+  // Vector (P_target - P_plane)
+  const diffX = targetPoint.x - planePoint.x;
+  const diffY = targetPoint.y - planePoint.y;
+  const diffZ = targetPoint.z - planePoint.z;
+
+  // Dot product: n · (P_target - P_plane)
+  const dotProduct = planeNormal.x * diffX + planeNormal.y * diffY + planeNormal.z * diffZ;
+  const depthM = Math.round(Math.abs(dotProduct) * 1000) / 1000;
+  const depthCm = Math.round(depthM * 100 * 10) / 10;
+
+  return { depthM, depthCm };
+}
+
+/**
+ * RULE: Mode 3 - Combined Area & Depth (MODE_AREA_DEPTH)
+ * Simultaneously calculate boundary perimeter area (MODE_AREA) and vertical extrusion/depth (MODE_DEPTH)
+ * Provides unified volumetric/surface metric readings (m² area and m depth) with zero scale drift
+ */
+export function computeUnifiedAreaDepthMeasurement(
+  perimeterAnchors: Point3D[],
+  targetPoint: Point3D,
+  referencePlanePoint: Point3D,
+  planeNormal: Point3D = { x: 0, y: 1, z: 0 }
+): {
+  areaM2: number;
+  depthM: number;
+  depthCm: number;
+  volumeM3: number;
+  volumeLiters: number;
+  bags50L: number;
+} {
+  const areaM2 = computeGaussAreaShoelace(perimeterAnchors);
+  const { depthM, depthCm } = computeOrthogonalDepth(targetPoint, referencePlanePoint, planeNormal);
+  const volumeM3 = Math.round(areaM2 * depthM * 1000) / 1000;
+  const volumeLiters = Math.round(volumeM3 * 1000);
+  const bags50L = Math.ceil(volumeLiters / 50);
+
+  return {
+    areaM2,
+    depthM,
+    depthCm,
+    volumeM3,
+    volumeLiters,
+    bags50L,
+  };
+}
+
+/**
  * RULE 6: Soil Excavation Depth & Volume Calculation Engine
  * Combines 2D projected horizontal surface area (ARPlane.Type.HORIZONTAL_UPWARD_FACING, Delta Y = 0)
  * with the measured excavation depth along the normal vector:
@@ -970,6 +1046,44 @@ export function computeSoilExcavationVolume(
     estimatedSoilBags50L,
     estimatedTruckloadsM3,
     depthPointsCount,
+  };
+}
+
+/**
+ * RULE: Standard 3D Euclidean Metric Distance (الحسابات المترية القياسية)
+ * d = sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
+ * Unit: 1.0 = strictly 1.0 meter (Zero arbitrary inflation / deflation)
+ */
+export function computeEuclideanDistance3D(p1: Point3D, p2: Point3D): number {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const dz = p2.z - p1.z;
+  const distM = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  return Math.round(distM * 1000) / 1000;
+}
+
+/**
+ * Immutable Spatial Snapshot on Frame Freeze (عزل انحراف اللقطة المجمّدة)
+ * Captures absolute 3D metric coordinates into an immutable structure,
+ * completely decoupling calculation pipelines from live camera updates (session.update() / camera.pose).
+ */
+export interface ImmutableSpatialSnapshot {
+  frozenPerimeterPoints: ReadonlyArray<Point3D>;
+  frozenDepthTarget: Point3D | null;
+  frozenReferencePlane: Point3D | null;
+  freezeTimestamp: number;
+}
+
+export function createImmutableSpatialSnapshot(
+  perimeterPoints: Point3D[],
+  depthTarget: Point3D | null = null,
+  referencePlane: Point3D | null = null
+): ImmutableSpatialSnapshot {
+  return {
+    frozenPerimeterPoints: Object.freeze(perimeterPoints.map(p => Object.freeze({ x: p.x, y: p.y, z: p.z }))),
+    frozenDepthTarget: depthTarget ? Object.freeze({ x: depthTarget.x, y: depthTarget.y, z: depthTarget.z }) : null,
+    frozenReferencePlane: referencePlane ? Object.freeze({ x: referencePlane.x, y: referencePlane.y, z: referencePlane.z }) : null,
+    freezeTimestamp: Date.now(),
   };
 }
 

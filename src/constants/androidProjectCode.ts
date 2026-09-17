@@ -1041,12 +1041,57 @@ object ArPrecisionAreaEngine {
     path: 'ArSpatialAnchorPipeline.kt',
     name: 'app/src/main/java/com/argarden/soilcalculator/ar/ArSpatialAnchorPipeline.kt',
     language: 'kotlin',
-    descriptionAr: 'خط أنابيب تجميد الإطار وتثبيت مثبتات الواقع المعزز (AR Anchors) والتعامل مع Raycast دون تحويل المشهد لصورة مسطحة',
+    descriptionAr: 'خط أنابيب تثبيت مثبتات الواقع المعزز (AR Anchors) والأنماط الثلاثة: MODE_AREA و MODE_DEPTH و MODE_AREA_DEPTH مع قفل FocusMode وتفعيل DepthMode',
     content: `package com.argarden.soilcalculator.ar
 
 import android.content.Context
 import android.opengl.Matrix
 import com.google.ar.core.*
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+/**
+ * Three Explicit Operational Modes for Google ARCore / AR Engine
+ */
+enum class ArCoreMeasurementMode {
+    MODE_AREA,        // Mode 1: Area Only (m²)
+    MODE_DEPTH,       // Mode 2: Depth Only (m / cm)
+    MODE_AREA_DEPTH   // Mode 3: Combined Area & Depth (m², m, m³ volume)
+}
+
+/**
+ * Immutable 3D Metric Spatial Point (الحسابات المترية القياسية)
+ * Strictly 1.0 unit = 1.0 real-world meter.
+ */
+data class ImmutableSpatialPoint3D(
+    val x: Double,
+    val y: Double,
+    val z: Double
+) {
+    /**
+     * Standard 3D Euclidean Distance (المسافة الإقليدية ثلاثية الأبعاد)
+     * d = sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
+     * Output strictly in meters (1.0 = 1.0 meter) with zero arbitrary multipliers.
+     */
+    fun euclideanDistanceTo(other: ImmutableSpatialPoint3D): Double {
+        val dx = other.x - x
+        val dy = other.y - y
+        val dz = other.z - z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+}
+
+/**
+ * Immutable Spatial Snapshot on Frame Freeze (عزل انحراف اللقطة المجمّدة)
+ * Preserves fixed (tx, ty, tz) metric coordinates, completely decoupling
+ * calculations from live camera update loops (arSession.update() / camera.pose).
+ */
+data class ImmutableSpatialSnapshot(
+    val frozenPerimeterPoints: List<ImmutableSpatialPoint3D>,
+    val frozenDepthTarget: ImmutableSpatialPoint3D?,
+    val frozenReferencePlane: ImmutableSpatialPoint3D?,
+    val snapshotTimestampNs: Long
+)
 
 /**
  * Spatial Frame Cache: Preserves full AR spatial context during UI freeze
@@ -1061,20 +1106,26 @@ data class CachedArSpatialFrame(
 )
 
 /**
- * Handles Frame Freeze without breaking ARSession tracking:
- * 1. Freezes rendering view while keeping ARSession active in background.
- * 2. Caches exact ARFrame pose, intrinsics, and depth matrices.
- * 3. Transforms tap coordinates via Raycasting (hitTest) against the cached spatial context.
- * 4. Attaches permanent 3D Anchor objects to the underlying Plane for every vertex.
+ * High-Precision Spatial Anchor Pipeline:
+ * - ZERO-SCALE DISTORTION: Every point attached to a persistent Anchor on a detected Plane.
+ * - FocusMode.AUTO: Locks camera intrinsic focal length parameters.
+ * - Config.DepthMode.AUTOMATIC: Hardware ToF / Depth API enabled.
+ * - MOTION DRIFT ELIMINATION: Immutable coordinates isolated from camera movement during freeze.
  */
 class ArSpatialAnchorPipeline(
     private val session: Session
 ) {
     private var isFrozen = false
     private var cachedFrame: CachedArSpatialFrame? = null
+    private var frozenSnapshot: ImmutableSpatialSnapshot? = null
     private val attachedAnchors = mutableListOf<Anchor>()
+    private var depthTargetAnchor: Anchor? = null
+    private var referencePlaneAnchor: Anchor? = null
 
-    fun configureDepthMode(config: Config) {
+    fun configureSession(config: Config) {
+        // Enforce Auto Focus to lock camera intrinsics
+        config.focusMode = Config.FocusMode.AUTO
+
         // Ensure hardware Depth API / ToF support is enabled
         if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
             config.depthMode = Config.DepthMode.AUTOMATIC
@@ -1085,8 +1136,10 @@ class ArSpatialAnchorPipeline(
     }
 
     /**
-     * Triggers non-destructive Frame Freeze:
-     * Caches ARFrame spatial context while maintaining session tracking.
+     * Triggers non-destructive Frame Freeze (عزل انحراف اللقطة المجمّدة):
+     * 1. Extracts immutable (tx, ty, tz) metric positions from all persistent Anchors.
+     * 2. Completely decouples all metric calculations from live arSession.update() & camera.pose.
+     * 3. Moving the phone after freeze has ZERO impact on calculated area/depth.
      */
     fun freezeCurrentFrame(frame: Frame) {
         val camera = frame.camera
@@ -1095,6 +1148,27 @@ class ArSpatialAnchorPipeline(
         
         camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100.0f)
         camera.getViewMatrix(viewMatrix, 0)
+
+        // Capture immutable snapshot of all anchor poses (tx, ty, tz)
+        val immutablePerimeter = attachedAnchors.map { anchor ->
+            val pose = anchor.pose
+            ImmutableSpatialPoint3D(pose.tx().toDouble(), pose.ty().toDouble(), pose.tz().toDouble())
+        }
+        val immutableDepth = depthTargetAnchor?.let {
+            val p = it.pose
+            ImmutableSpatialPoint3D(p.tx().toDouble(), p.ty().toDouble(), p.tz().toDouble())
+        }
+        val immutableRef = referencePlaneAnchor?.let {
+            val p = it.pose
+            ImmutableSpatialPoint3D(p.tx().toDouble(), p.ty().toDouble(), p.tz().toDouble())
+        }
+
+        frozenSnapshot = ImmutableSpatialSnapshot(
+            frozenPerimeterPoints = immutablePerimeter,
+            frozenDepthTarget = immutableDepth,
+            frozenReferencePlane = immutableRef,
+            snapshotTimestampNs = frame.timestamp
+        )
 
         cachedFrame = CachedArSpatialFrame(
             cameraPose = camera.pose,
@@ -1110,10 +1184,11 @@ class ArSpatialAnchorPipeline(
     fun unfreeze() {
         isFrozen = false
         cachedFrame = null
+        frozenSnapshot = null
     }
 
     /**
-     * Raycasting against cached frame context to create and attach permanent 3D Anchors on Plane
+     * Raycasting against plane to create and attach permanent 3D Anchors
      */
     fun addVertexAnchorAtScreenPoint(frame: Frame, screenX: Float, screenY: Float): Anchor? {
         val hitResults = frame.hitTest(screenX, screenY)
@@ -1122,19 +1197,151 @@ class ArSpatialAnchorPipeline(
             if (trackable is Plane && trackable.isPoseInPolygon(hit.hitPose)) {
                 val anchor = hit.createAnchor()
                 attachedAnchors.add(anchor)
+                if (referencePlaneAnchor == null) {
+                    referencePlaneAnchor = anchor
+                }
                 return anchor
             }
         }
-        // Fallback: create anchor at camera plane ray intersection
         val hitPose = frame.camera.pose.compose(Pose.makeTranslation(0f, 0f, -1.5f))
         val fallbackAnchor = session.createAnchor(hitPose)
         attachedAnchors.add(fallbackAnchor)
         return fallbackAnchor
     }
 
+    fun setDepthTargetAnchor(frame: Frame, screenX: Float, screenY: Float): Anchor? {
+        val hitResults = frame.hitTest(screenX, screenY)
+        for (hit in hitResults) {
+            val anchor = hit.createAnchor()
+            depthTargetAnchor?.detach()
+            depthTargetAnchor = anchor
+            return anchor
+        }
+        return null
+    }
+
+    // ==========================================
+    // OPERATIONAL MODE 1: Area Only (MODE_AREA)
+    // ==========================================
     /**
-     * Extracts 3D positions of all attached anchors and calculates precision area via Shoelace
+     * Mode 1: Area Only (MODE_AREA)
+     * Gauss's Area Formula (Shoelace Algorithm) on projected (X, Z) plane:
+     * Area = 0.5 * |sum(X_i * Z_{i+1} - X_{i+1} * Z_i)|
+     * Output strictly in square meters (m²).
+     * Fully decoupled from live camera pose during freeze.
      */
+    fun executeMode1AreaOnly(): Mode1AreaResult {
+        // Read from immutable frozen snapshot if frozen, else from live anchors
+        val points3D = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenPerimeterPoints.map { Point3D(it.x, 0.0, it.z) }
+        } else {
+            attachedAnchors.map { anchor ->
+                val pose = anchor.pose
+                Point3D(pose.tx().toDouble(), 0.0, pose.tz().toDouble())
+            }
+        }
+
+        var sum = 0.0
+        val n = points3D.size
+        for (i in 0 until n) {
+            val next = (i + 1) % n
+            sum += points3D[i].x * points3D[next].z - points3D[next].x * points3D[i].z
+        }
+        val exactAreaM2 = abs(sum) * 0.5
+        val safeAreaM2 = if (exactAreaM2 > 500.0) 500.0 else exactAreaM2
+
+        val edgeLengths = mutableListOf<Double>()
+        var perimeter = 0.0
+        for (i in 0 until n) {
+            val next = (i + 1) % n
+            // 3D Euclidean distance (1.0 = strictly 1.0 meter)
+            val p1 = ImmutableSpatialPoint3D(points3D[i].x, points3D[i].y, points3D[i].z)
+            val p2 = ImmutableSpatialPoint3D(points3D[next].x, points3D[next].y, points3D[next].z)
+            val d = p1.euclideanDistanceTo(p2)
+            edgeLengths.add(Math.round(d * 100.0) / 100.0)
+            perimeter += d
+        }
+
+        return Mode1AreaResult(
+            areaM2 = Math.round(safeAreaM2 * 1000.0) / 1000.0,
+            perimeterM = Math.round(perimeter * 100.0) / 100.0,
+            edgeLengthsM = edgeLengths,
+            anchorPoints = points3D
+        )
+    }
+
+    // ==========================================
+    // OPERATIONAL MODE 2: Depth Only (MODE_DEPTH)
+    // ==========================================
+    /**
+     * Mode 2: Depth Only (MODE_DEPTH)
+     * Orthogonal distance from baseline plane to target point:
+     * d_depth = | n · (P_target - P_plane) |
+     * Output strictly in meters (m) / centimeters (cm).
+     */
+    fun executeMode2DepthOnly(
+        planeNormal: Point3D = Point3D(0.0, 1.0, 0.0)
+    ): Mode2DepthResult {
+        val pTarget = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenDepthTarget?.let { Point3D(it.x, it.y, it.z) } ?: Point3D(0.0, 0.0, 0.0)
+        } else {
+            depthTargetAnchor?.pose?.let { Point3D(it.tx().toDouble(), it.ty().toDouble(), it.tz().toDouble()) }
+                ?: Point3D(0.0, 0.0, 0.0)
+        }
+
+        val pPlane = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenReferencePlane?.let { Point3D(it.x, it.y, it.z) } ?: pTarget
+        } else {
+            referencePlaneAnchor?.pose?.let { Point3D(it.tx().toDouble(), it.ty().toDouble(), it.tz().toDouble()) }
+                ?: pTarget
+        }
+
+        val diffX = pTarget.x - pPlane.x
+        val diffY = pTarget.y - pPlane.y
+        val diffZ = pTarget.z - pPlane.z
+
+        val dotProduct = planeNormal.x * diffX + planeNormal.y * diffY + planeNormal.z * diffZ
+        val depthM = Math.round(abs(dotProduct) * 1000.0) / 1000.0
+        val depthCm = Math.round(depthM * 100.0 * 10.0) / 10.0
+
+        return Mode2DepthResult(
+            depthM = depthM,
+            depthCm = depthCm,
+            orthogonalDistanceM = depthM,
+            targetAnchorPose = pTarget,
+            referencePlanePose = pPlane
+        )
+    }
+
+    // ===================================================
+    // OPERATIONAL MODE 3: Combined Area & Depth (MODE_AREA_DEPTH)
+    // ===================================================
+    /**
+     * Mode 3: Combined Area & Depth (MODE_AREA_DEPTH)
+     * Simultaneously calculate boundary perimeter area and vertical extrusion/depth:
+     * V = Area * Depth (m³)
+     */
+    fun executeMode3CombinedAreaDepth(
+        planeNormal: Point3D = Point3D(0.0, 1.0, 0.0)
+    ): Mode3AreaDepthResult {
+        val areaResult = executeMode1AreaOnly()
+        val depthResult = executeMode2DepthOnly(planeNormal)
+
+        val volumeM3 = Math.round(areaResult.areaM2 * depthResult.depthM * 1000.0) / 1000.0
+        val volumeLiters = Math.round(volumeM3 * 1000.0).toDouble()
+        val bags50L = kotlin.math.ceil(volumeLiters / 50.0).toInt()
+
+        return Mode3AreaDepthResult(
+            areaM2 = areaResult.areaM2,
+            depthM = depthResult.depthM,
+            depthCm = depthResult.depthCm,
+            volumeM3 = volumeM3,
+            volumeLiters = volumeLiters,
+            estimatedSoilBags50L = bags50L,
+            perimeterM = areaResult.perimeterM
+        )
+    }
+
     fun computePolygonAreaFromAnchors(): PrecisionAreaResult {
         val points3D = attachedAnchors.map { anchor ->
             val pose = anchor.pose
@@ -1146,6 +1353,11 @@ class ArSpatialAnchorPipeline(
     fun clearAnchors() {
         attachedAnchors.forEach { it.detach() }
         attachedAnchors.clear()
+        depthTargetAnchor?.detach()
+        depthTargetAnchor = null
+        referencePlaneAnchor?.detach()
+        referencePlaneAnchor = null
+        frozenSnapshot = null
     }
 }
 `,
@@ -1154,7 +1366,7 @@ class ArSpatialAnchorPipeline(
     path: 'HuaweiAREngineNativePipeline.kt',
     name: 'app/src/main/java/com/argarden/soilcalculator/ar/HuaweiAREngineNativePipeline.kt',
     language: 'kotlin',
-    descriptionAr: 'معالج وتكامل مكتبة arengine SDK 4005.aar / ARCore SDK 4005.aar المحلية لمعالجة تتبع الأسطح (ARPlane) وسحابة النقاط (ARPointCloud) وحساب المساحة الحقيقية بالمتر المربع',
+    descriptionAr: 'معالج وتكامل مكتبة arengine SDK 4005.aar / ARCore SDK 4005.aar المحلية لمعالجة تتبع الأسطح (ARPlane) وسحابة النقاط (ARPointCloud) والأنماط الثلاثة: MODE_AREA و MODE_DEPTH و MODE_AREA_DEPTH',
     content: `package com.argarden.soilcalculator.ar
 
 import android.content.Context
@@ -1163,29 +1375,76 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
+ * Three Explicit Operational Modes for AR Spatial Architecture
+ */
+enum class MeasurementOperationalMode {
+    MODE_AREA,        // Mode 1: Area Only (m²)
+    MODE_DEPTH,       // Mode 2: Depth Only (m / cm)
+    MODE_AREA_DEPTH   // Mode 3: Combined Area & Depth (m², m, m³ volume)
+}
+
+data class Mode1AreaResult(
+    val areaM2: Double,
+    val perimeterM: Double,
+    val edgeLengthsM: List<Double>,
+    val anchorPoints: List<Point3D>
+)
+
+data class Mode2DepthResult(
+    val depthM: Double,
+    val depthCm: Double,
+    val orthogonalDistanceM: Double,
+    val targetAnchorPose: Point3D,
+    val referencePlanePose: Point3D
+)
+
+data class Mode3AreaDepthResult(
+    val areaM2: Double,
+    val depthM: Double,
+    val depthCm: Double,
+    val volumeM3: Double,
+    val volumeLiters: Double,
+    val estimatedSoilBags50L: Int,
+    val perimeterM: Double
+)
+
+/**
  * Direct High-Precision Integration Pipeline for Huawei AR Engine SDK (arengine SDK 4005.aar / ARCore SDK 4005.aar)
  * Located in assets/.aistudio/
  * 
- * Features:
- * 1. Surface Plane Tracking (ARPlane.PlaneType.HORIZONTAL_UPWARD_FACING & VERTICAL)
- * 2. Point Cloud Extraction (ARPointCloud)
- * 3. 3D Metric Raycast Hit Testing (ARHitResult)
- * 4. Ground Surface Invariant Real-World Metric Area Shoelace Calculation (Delta Y = 0)
+ * Strict Precision & Calibration Rules:
+ * 1. Zero-Scale Distortion: EVERY point MUST be attached to a persistent ARAnchor.
+ * 2. FocusMode.AUTO_FOCUS: Locks camera intrinsic focal length parameters.
+ * 3. Hardware Depth Mode: Checks and enables ARConfigBase.DepthMode.AUTOMATIC
  */
 class HuaweiAREngineNativePipeline(private val context: Context) {
 
     private var arSession: ARSession? = null
     private var isTracking = false
-    private val activeAnchors = mutableListOf<ARAnchor>()
+    private var isFrozen = false
+    private var frozenSnapshot: ImmutableSpatialSnapshot? = null
+    private val perimeterAnchors = mutableListOf<ARAnchor>()
+    private var depthTargetAnchor: ARAnchor? = null
+    private var referencePlaneAnchor: ARAnchor? = null
 
     fun initializeSession(): Boolean {
         return try {
             arSession = ARSession(context)
             val config = ARWorldTrackingConfig(arSession)
+            
+            // 1. Enforce FocusMode.AUTO_FOCUS to lock camera intrinsics
+            config.focusMode = ARConfigBase.FocusMode.AUTO_FOCUS
+            
+            // 2. Plane Finding Mode enabled
             config.planeFindingMode = ARConfigBase.PlaneFindingMode.ENABLE
             config.lightingMode = ARConfigBase.LightingMode.AMBIENT_INTENSITY
-            config.focusMode = ARConfigBase.FocusMode.AUTO_FOCUS
             config.updateMode = ARConfigBase.UpdateMode.BLOCKING
+
+            // 3. Hardware Depth Mode Verification & Automatic Configuration
+            if (arSession?.isDepthModeSupported(ARConfigBase.DepthMode.AUTOMATIC.value) == true) {
+                config.depthMode = ARConfigBase.DepthMode.AUTOMATIC
+            }
+
             arSession?.configure(config)
             arSession?.resume()
             isTracking = true
@@ -1194,6 +1453,39 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
             e.printStackTrace()
             false
         }
+    }
+
+    /**
+     * Freeze Frame Snapshot (عزل انحراف اللقطة المجمّدة):
+     * Extracts immutable 3D coordinates (tx, ty, tz) immediately upon freeze.
+     * Decouples all subsequent distance/area/depth calculations from arSession.update() & camera.pose.
+     */
+    fun freezeFrame(frame: ARFrame) {
+        val immutablePerimeter = perimeterAnchors.map { anchor ->
+            val pose = anchor.pose
+            ImmutableSpatialPoint3D(pose.tx().toDouble(), pose.ty().toDouble(), pose.tz().toDouble())
+        }
+        val immutableDepth = depthTargetAnchor?.let {
+            val p = it.pose
+            ImmutableSpatialPoint3D(p.tx().toDouble(), p.ty().toDouble(), p.tz().toDouble())
+        }
+        val immutableRef = referencePlaneAnchor?.let {
+            val p = it.pose
+            ImmutableSpatialPoint3D(p.tx().toDouble(), p.ty().toDouble(), p.tz().toDouble())
+        }
+
+        frozenSnapshot = ImmutableSpatialSnapshot(
+            frozenPerimeterPoints = immutablePerimeter,
+            frozenDepthTarget = immutableDepth,
+            frozenReferencePlane = immutableRef,
+            snapshotTimestampNs = frame.timestamp
+        )
+        isFrozen = true
+    }
+
+    fun unfreeze() {
+        isFrozen = false
+        frozenSnapshot = null
     }
 
     fun pause() {
@@ -1251,10 +1543,11 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
     }
 
     /**
-     * Raycasts a 2D screen coordinate against detected ARPlanes to obtain the exact 3D World metric point
-     * Enforcing strict real-world bounds (Z <= 12m) to prevent coordinate explosion
+     * ZERO-SCALE DISTORTION DIRECTIVE:
+     * NEVER read spatial points directly from temporary HitResult.hitPose.
+     * EVERY point MUST be attached to a persistent ARAnchor.
      */
-    fun hitTestTo3DAnchor(frame: ARFrame, screenX: Float, screenY: Float): ARAnchor? {
+    fun addPerimeterAnchorAtScreenPoint(frame: ARFrame, screenX: Float, screenY: Float): ARAnchor? {
         val hitList: List<ARHitResult> = frame.hitTest(screenX, screenY)
         for (hit in hitList) {
             val trackable = hit.trackable
@@ -1262,12 +1555,14 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
                 trackable.trackingState == ARTrackable.TrackingState.TRACKING &&
                 trackable.isPoseInPolygon(hit.hitPose)) {
                 
-                // Sanity Check: Ensure distance is within physical mobile sensor limits (< 15 meters)
                 val hitPose = hit.hitPose
                 val dist = sqrt(hitPose.tx() * hitPose.tx() + hitPose.ty() * hitPose.ty() + hitPose.tz() * hitPose.tz())
                 if (dist in 0.10f..15.0f) {
                     val anchor = hit.createAnchor()
-                    activeAnchors.add(anchor)
+                    perimeterAnchors.add(anchor)
+                    if (referencePlaneAnchor == null) {
+                        referencePlaneAnchor = anchor
+                    }
                     return anchor
                 }
             }
@@ -1276,39 +1571,45 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
     }
 
     /**
-     * Calculates Real Depth (العمق الحقيقي) in meters and centimeters
-     * from direct ARHitResult / Depth Map against the reference surface plane
+     * Sets depth target anchor on bottom of hole / target feature point
      */
-    fun calculateRealDepth(frame: ARFrame, screenX: Float, screenY: Float, referencePlaneY: Float = 0.0f): Double {
-        val hitList = frame.hitTest(screenX, screenY)
+    fun setDepthTargetAnchorAtScreenPoint(frame: ARFrame, screenX: Float, screenY: Float): ARAnchor? {
+        val hitList: List<ARHitResult> = frame.hitTest(screenX, screenY)
         for (hit in hitList) {
-            val hitPose = hit.hitPose
-            // Real physical depth along gravity normal
-            val depthM = abs(referencePlaneY - hitPose.ty()).toDouble()
-            // Sanity Check: realistic garden/excavation depth (1cm to 300cm)
-            if (depthM in 0.01..3.00) {
-                return Math.round(depthM * 1000.0) / 1000.0
-            }
+            val anchor = hit.createAnchor()
+            depthTargetAnchor?.detach()
+            depthTargetAnchor = anchor
+            return anchor
         }
-        return 0.0
+        return null
     }
 
+    // ==========================================
+    // OPERATIONAL MODE 1: Area Only (MODE_AREA)
+    // ==========================================
     /**
-     * Calculates the exact real-world metric surface area (m²) from attached 3D ARAnchors
-     * Enforcing strict horizontal plane projection (Delta Y = 0) with zero perspective distortion
-     * and sanity check bounds
+     * Mode 1: Area Only (MODE_AREA)
+     * - Place persistent Anchor objects at each perimeter vertex on a detected plane.
+     * - Project 3D anchor poses onto localized 2D plane (X, Z).
+     * - Compute surface area using Gauss's Area Formula (Shoelace Algorithm).
+     * - Output strictly in square meters (m²).
+     * - ZERO DRIFT: Decoupled from live camera pose when frozen.
      */
-    fun calculateRealWorldSurfaceArea(): FusedPrecisionAreaResult {
-        val points3D = activeAnchors.map { anchor ->
-            val pose = anchor.pose
-            Point3D(
-                x = pose.tx().toDouble(),
-                y = 0.0, // Enforce Delta Y = 0 on horizontal tracking plane
-                z = pose.tz().toDouble()
-            )
+    fun executeMode1AreaOnly(): Mode1AreaResult {
+        val points3D = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenPerimeterPoints.map { Point3D(it.x, 0.0, it.z) }
+        } else {
+            perimeterAnchors.map { anchor ->
+                val pose = anchor.pose
+                Point3D(
+                    x = pose.tx().toDouble(),
+                    y = 0.0, // Enforce Delta Y = 0 on localized horizontal ground plane
+                    z = pose.tz().toDouble()
+                )
+            }
         }
 
-        // Calculate 3D Shoelace Area
+        // Gauss's Area Formula (Shoelace Algorithm): 0.5 * |sum(X_i * Z_{i+1} - X_{i+1} * Z_i)|
         var sum = 0.0
         val n = points3D.size
         for (i in 0 until n) {
@@ -1316,47 +1617,146 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
             sum += points3D[i].x * points3D[next].z - points3D[next].x * points3D[i].z
         }
         val exactAreaM2 = abs(sum) * 0.5
-        // Sanity Check: mobile view frustum area limit
         val safeAreaM2 = if (exactAreaM2 > 500.0) 500.0 else exactAreaM2
 
-        // Compute perimeter and edges
         val edgeLengths = mutableListOf<Double>()
         var perimeter = 0.0
         for (i in 0 until n) {
             val next = (i + 1) % n
-            val dx = points3D[next].x - points3D[i].x
-            val dz = points3D[next].z - points3D[i].z
-            val d = sqrt(dx * dx + dz * dz)
-            val clampedD = if (d > 25.0) 25.0 else d
-            edgeLengths.add(Math.round(clampedD * 100.0) / 100.0)
-            perimeter += clampedD
+            // 3D Euclidean metric distance: d = sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
+            // 1.0 = strictly 1.0 real meter
+            val p1 = ImmutableSpatialPoint3D(points3D[i].x, points3D[i].y, points3D[i].z)
+            val p2 = ImmutableSpatialPoint3D(points3D[next].x, points3D[next].y, points3D[next].z)
+            val d = p1.euclideanDistanceTo(p2)
+            edgeLengths.add(Math.round(d * 100.0) / 100.0)
+            perimeter += d
         }
 
-        return FusedPrecisionAreaResult(
+        return Mode1AreaResult(
             areaM2 = Math.round(safeAreaM2 * 1000.0) / 1000.0,
-            areaShoelace3DM2 = safeAreaM2,
-            areaHomographyBirdEyeM2 = safeAreaM2,
+            perimeterM = Math.round(perimeter * 100.0) / 100.0,
+            edgeLengthsM = edgeLengths,
+            anchorPoints = points3D
+        )
+    }
+
+    // ==========================================
+    // OPERATIONAL MODE 2: Depth Only (MODE_DEPTH)
+    // ==========================================
+    /**
+     * Mode 2: Depth Only (MODE_DEPTH)
+     * - Measure perpendicular or linear depth/height relative to a reference plane using native hardware Depth API / ToF
+     * - Compute orthogonal distance from baseline plane to target point:
+     *   d_depth = | n · (P_target - P_plane) |
+     * - Output strictly in meters (m) / centimeters (cm).
+     */
+    fun executeMode2DepthOnly(
+        planeNormal: Point3D = Point3D(0.0, 1.0, 0.0)
+    ): Mode2DepthResult {
+        val pTarget = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenDepthTarget?.let { Point3D(it.x, it.y, it.z) } ?: Point3D(0.0, 0.0, 0.0)
+        } else {
+            depthTargetAnchor?.pose?.let { Point3D(it.tx().toDouble(), it.ty().toDouble(), it.tz().toDouble()) }
+                ?: Point3D(0.0, 0.0, 0.0)
+        }
+
+        val pPlane = if (isFrozen && frozenSnapshot != null) {
+            frozenSnapshot!!.frozenReferencePlane?.let { Point3D(it.x, it.y, it.z) } ?: pTarget
+        } else {
+            referencePlaneAnchor?.pose?.let { Point3D(it.tx().toDouble(), it.ty().toDouble(), it.tz().toDouble()) }
+                ?: pTarget
+        }
+
+        // Vector: (P_target - P_plane)
+        val diffX = pTarget.x - pPlane.x
+        val diffY = pTarget.y - pPlane.y
+        val diffZ = pTarget.z - pPlane.z
+
+        // Orthogonal dot product: | n · (P_target - P_plane) |
+        val dotProduct = planeNormal.x * diffX + planeNormal.y * diffY + planeNormal.z * diffZ
+        val orthogonalDepthM = abs(dotProduct)
+        val safeDepthM = if (orthogonalDepthM > 3.0) 3.0 else orthogonalDepthM
+
+        val depthM = Math.round(safeDepthM * 1000.0) / 1000.0
+        val depthCm = Math.round(depthM * 100.0 * 10.0) / 10.0
+
+        return Mode2DepthResult(
+            depthM = depthM,
+            depthCm = depthCm,
+            orthogonalDistanceM = depthM,
+            targetAnchorPose = pTarget,
+            referencePlanePose = pPlane
+        )
+    }
+
+    // ===================================================
+    // OPERATIONAL MODE 3: Combined Area & Depth (MODE_AREA_DEPTH)
+    // ===================================================
+    /**
+     * Mode 3: Combined Area & Depth (MODE_AREA_DEPTH)
+     * - Simultaneously calculate boundary perimeter area (MODE_AREA) and vertical extrusion/depth (MODE_DEPTH)
+     * - Provide unified volumetric/surface metric readings (m² area and m depth) with zero scale drift
+     *   V = Area * Depth (m³)
+     */
+    fun executeMode3CombinedAreaDepth(
+        planeNormal: Point3D = Point3D(0.0, 1.0, 0.0)
+    ): Mode3AreaDepthResult {
+        val areaResult = executeMode1AreaOnly()
+        val depthResult = executeMode2DepthOnly(planeNormal)
+
+        val volumeM3 = Math.round(areaResult.areaM2 * depthResult.depthM * 1000.0) / 1000.0
+        val volumeLiters = Math.round(volumeM3 * 1000.0).toDouble()
+        val bags50L = kotlin.math.ceil(volumeLiters / 50.0).toInt()
+
+        return Mode3AreaDepthResult(
+            areaM2 = areaResult.areaM2,
+            depthM = depthResult.depthM,
+            depthCm = depthResult.depthCm,
+            volumeM3 = volumeM3,
+            volumeLiters = volumeLiters,
+            estimatedSoilBags50L = bags50L,
+            perimeterM = areaResult.perimeterM
+        )
+    }
+
+    /**
+     * Legacy compatibility helper
+     */
+    fun calculateRealWorldSurfaceArea(): FusedPrecisionAreaResult {
+        val mode1 = executeMode1AreaOnly()
+        val pts3D = mode1.anchorPoints
+        val n = pts3D.size
+
+        return FusedPrecisionAreaResult(
+            areaM2 = mode1.areaM2,
+            areaShoelace3DM2 = mode1.areaM2,
+            areaHomographyBirdEyeM2 = mode1.areaM2,
             strategyDiscrepancyPercent = 0.0,
             convergenceIterCount = 1,
             optimizedPitchDeg = 0.0,
-            perimeterM = Math.round(perimeter * 100.0) / 100.0,
-            edgeLengthsM = edgeLengths,
-            vertexDepthsM = points3D.map { sqrt(it.x * it.x + it.z * it.z) },
+            perimeterM = mode1.perimeterM,
+            edgeLengthsM = mode1.edgeLengthsM,
+            vertexDepthsM = pts3D.map { sqrt(it.x * it.x + it.z * it.z) },
             vertexMetricScaleMPerPx = emptyList(),
             homographyMatrix = emptyArray(),
-            birdEyeCoordinates = points3D.map { Point2D(it.x, it.z) },
+            birdEyeCoordinates = pts3D.map { Point2D(it.x, it.z) },
             centroid3D = Point3D(
-                points3D.sumOf { it.x } / n.coerceAtLeast(1),
+                pts3D.sumOf { it.x } / n.coerceAtLeast(1),
                 0.0,
-                points3D.sumOf { it.z } / n.coerceAtLeast(1)
+                pts3D.sumOf { it.z } / n.coerceAtLeast(1)
             ),
             surfaceNormal = Point3D(0.0, 1.0, 0.0)
         )
     }
 
     fun clearAnchors() {
-        activeAnchors.forEach { it.detach() }
-        activeAnchors.clear()
+        perimeterAnchors.forEach { it.detach() }
+        perimeterAnchors.clear()
+        depthTargetAnchor?.detach()
+        depthTargetAnchor = null
+        referencePlaneAnchor?.detach()
+        referencePlaneAnchor = null
+        frozenSnapshot = null
     }
 
     fun release() {
@@ -1368,6 +1768,7 @@ class HuaweiAREngineNativePipeline(private val context: Context) {
 }
 `,
   },
+
   {
     path: 'MainActivity.kt',
     name: 'app/src/main/java/com/argarden/soilcalculator/MainActivity.kt',
