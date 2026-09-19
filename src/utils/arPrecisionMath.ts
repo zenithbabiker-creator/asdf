@@ -531,94 +531,41 @@ export function fusedPrecisionAreaCalculation(
     };
   }
 
-  // Base parameters
-  let currentPitchRad = Math.max(0.10, Math.min(1.50, frameContext.cameraPitchRad));
-  let iterCount = 0;
-  const maxIters = 8;
-  let areaA = 0;
-  let areaB = 0;
-  let discrepancyPercent = 0;
-  let bestPoints3D: Point3D[] = [];
-  let bestBirdEyeCoords: Point2D[] = [];
-  let bestHMat: number[][] = [];
+  // Base parameters - strictly preserve the physical calibrated sensor pitch angle without arbitrary search warping
+  const currentPitchRad = Math.max(0.15, Math.min(1.45, frameContext.cameraPitchRad));
+  let iterCount = 1;
 
-  const evaluateAtPitch = (pitch: number) => {
-    // Strategy 1: Raycasting to 3D World Space
-    const pts3D = screenPoints.map((pt) =>
-      raycastScreenPointTo3DPlane(pt, frameContext, viewportWidth, viewportHeight, rollRad, pitch)
-    );
-    // Compute 3D Shoelace on ground plane (X, Z)
-    let sumA = 0;
-    const n = pts3D.length;
-    for (let i = 0; i < n; i++) {
-      const next = (i + 1) % n;
-      sumA += pts3D[i].x * pts3D[next].z - pts3D[next].x * pts3D[i].z;
-    }
-    const computedAreaA = Math.abs(sumA) * 0.5 * (scaleFactor * scaleFactor);
+  // Direct Deterministic Spatial Ground Raycasting (Exact 3D Coordinates X, Y=0, Z in meters)
+  const bestPoints3D = screenPoints.map((pt) =>
+    raycastScreenPointTo3DPlane(pt, frameContext, viewportWidth, viewportHeight, rollRad, currentPitchRad)
+  );
 
-    // Strategy 2: Homography Bird's Eye View
-    const { H, H_inv } = computePlanarHomographyMatrix(frameContext, viewportWidth, viewportHeight, rollRad, pitch);
-    const birdEye = screenPoints.map((pt) => unprojectViaHomography(pt, H_inv));
-    let sumB = 0;
-    for (let i = 0; i < n; i++) {
-      const next = (i + 1) % n;
-      sumB += birdEye[i].x * birdEye[next].y - birdEye[next].x * birdEye[i].y;
-    }
-    const computedAreaB = Math.abs(sumB) * 0.5 * (scaleFactor * scaleFactor);
-
-    const avgArea = (computedAreaA + computedAreaB) / 2;
-    const disc = avgArea > 1e-6 ? (Math.abs(computedAreaA - computedAreaB) / avgArea) * 100 : 0;
-
-    return {
-      computedAreaA,
-      computedAreaB,
-      disc,
-      pts3D,
-      birdEye,
-      H
-    };
-  };
-
-  // Initial evaluation
-  let currentEval = evaluateAtPitch(currentPitchRad);
-  areaA = currentEval.computedAreaA;
-  areaB = currentEval.computedAreaB;
-  discrepancyPercent = currentEval.disc;
-  bestPoints3D = currentEval.pts3D;
-  bestBirdEyeCoords = currentEval.birdEye;
-  bestHMat = currentEval.H;
-
-  // Cross-verification & Convergence Loop:
-  // If discrepancy > 1%, optimize pitch in small step bounds to guarantee convergence
-  if (discrepancyPercent > 1.0) {
-    let step = (1.5 * Math.PI) / 180; // 1.5 degree search step
-    for (let i = 0; i < maxIters && discrepancyPercent > 0.05; i++) {
-      iterCount++;
-      const evalUp = evaluateAtPitch(currentPitchRad + step);
-      const evalDown = evaluateAtPitch(currentPitchRad - step);
-
-      if (evalUp.disc < discrepancyPercent) {
-        currentPitchRad += step;
-        currentEval = evalUp;
-      } else if (evalDown.disc < discrepancyPercent) {
-        currentPitchRad -= step;
-        currentEval = evalDown;
-      } else {
-        step *= 0.5; // Dampen step
-      }
-
-      areaA = currentEval.computedAreaA;
-      areaB = currentEval.computedAreaB;
-      discrepancyPercent = currentEval.disc;
-      bestPoints3D = currentEval.pts3D;
-      bestBirdEyeCoords = currentEval.birdEye;
-      bestHMat = currentEval.H;
-    }
+  // Compute exact Gauss Shoelace Area on the horizontal ground plane (X, Z):
+  // Area = 0.5 * |sum(X_i * Z_{i+1} - X_{i+1} * Z_i)|
+  let sumShoelace = 0;
+  const n = bestPoints3D.length;
+  for (let i = 0; i < n; i++) {
+    const next = (i + 1) % n;
+    sumShoelace += bestPoints3D[i].x * bestPoints3D[next].z - bestPoints3D[next].x * bestPoints3D[i].z;
   }
+  const computedAreaA = Math.abs(sumShoelace) * 0.5 * (scaleFactor * scaleFactor);
 
-  // Fused Invariant Area
-  const rawFusedArea = (areaA + areaB) / 2;
-  const areaM2 = Math.round(rawFusedArea * 1000) / 1000;
+  // Strategy 2: Planar Homography Orthorectification (Cross-Validation)
+  const { H, H_inv } = computePlanarHomographyMatrix(frameContext, viewportWidth, viewportHeight, rollRad, currentPitchRad);
+  const bestBirdEyeCoords = screenPoints.map((pt) => unprojectViaHomography(pt, H_inv));
+  let sumB = 0;
+  for (let i = 0; i < n; i++) {
+    const next = (i + 1) % n;
+    sumB += bestBirdEyeCoords[i].x * bestBirdEyeCoords[next].y - bestBirdEyeCoords[next].x * bestBirdEyeCoords[i].y;
+  }
+  const computedAreaB = Math.abs(sumB) * 0.5 * (scaleFactor * scaleFactor);
+
+  const avgArea = (computedAreaA + computedAreaB) / 2;
+  const discrepancyPercent = avgArea > 1e-6 ? (Math.abs(computedAreaA - computedAreaB) / avgArea) * 100 : 0;
+  const bestHMat = H;
+
+  // Fused Invariant Area strictly in physical square meters (m²)
+  const areaM2 = Math.round(avgArea * 1000) / 1000;
 
   // Strategy 3: Depth Map and Scale per Vertex
   const depthScale = computePerVertexDepthAndMetricScale(
@@ -692,8 +639,8 @@ export function fusedPrecisionAreaCalculation(
 
   return {
     areaM2,
-    areaShoelace3DM2: Math.round(areaA * 1000) / 1000,
-    areaHomographyBirdEyeM2: Math.round(areaB * 1000) / 1000,
+    areaShoelace3DM2: Math.round(computedAreaA * 1000) / 1000,
+    areaHomographyBirdEyeM2: Math.round(computedAreaB * 1000) / 1000,
     strategyDiscrepancyPercent: Math.round(discrepancyPercent * 100) / 100,
     convergenceIterCount: iterCount,
     optimizedPitchDeg: Math.round((currentPitchRad * 180) / Math.PI),
